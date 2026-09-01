@@ -1,7 +1,10 @@
 import os
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+from PIL import Image
 
 from weread_source import (
     WeReadController,
@@ -9,6 +12,13 @@ from weread_source import (
     WeReadSource,
     default_profile_dir,
 )
+
+
+def png_bytes(width=800, height=400):
+    image = Image.new("RGB", (width, height), "white")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 class FakeController:
@@ -168,6 +178,8 @@ class WeReadControllerLaunchTests(unittest.TestCase):
         first_call, second_call = chromium.launch_persistent_context.call_args_list
         self.assertNotIn("channel", first_call.kwargs)
         self.assertEqual(second_call.kwargs["channel"], "chrome")
+        self.assertEqual(first_call.kwargs["device_scale_factor"], 2)
+        self.assertEqual(second_call.kwargs["device_scale_factor"], 2)
 
     def test_missing_bundled_executable_falls_back_to_installed_chrome(self):
         expected_context = object()
@@ -270,7 +282,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
     def test_ocr_ignores_canvas_header_navigation(self):
         controller, page = self.make_connected_controller()
         canvas = Mock()
-        canvas.screenshot.return_value = b"png"
+        canvas.screenshot.return_value = png_bytes()
         locator = Mock()
         locator.count.return_value = 1
         locator.first = canvas
@@ -278,9 +290,9 @@ class WeReadControllerChapterTests(unittest.TestCase):
         controller._ocr_engine = Mock(
             return_value=(
                 [
-                    ([[0, 24], [90, 24], [90, 47], [0, 47]], "测试书", 0.99),
-                    ([[8, 85], [600, 85], [600, 108], [8, 108]], "正文第一行。", 0.98),
-                    ([[8, 127], [600, 127], [600, 149], [8, 149]], "正文第二行。", 0.97),
+                    ([[0, 48], [180, 48], [180, 94], [0, 94]], "测试书", 0.99),
+                    ([[16, 170], [700, 170], [700, 216], [16, 216]], "正文第一行。", 0.98),
+                    ([[16, 254], [700, 254], [700, 298], [16, 298]], "正文第二行。", 0.97),
                 ],
                 [0.1, 0.1, 0.1],
             )
@@ -289,7 +301,97 @@ class WeReadControllerChapterTests(unittest.TestCase):
         lines = controller._ocr_current_canvas()
 
         self.assertEqual(lines, ["正文第一行。", "正文第二行。"])
-        canvas.screenshot.assert_called_once_with(type="png")
+        canvas.screenshot.assert_called_once_with(type="png", scale="device")
+        self.assertEqual(controller._ocr_engine.call_args.kwargs["unclip_ratio"], 1.8)
+
+    def test_ocr_splits_tall_canvas_and_deduplicates_overlapping_lines(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.screenshot.return_value = png_bytes(width=800, height=3000)
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        tile_heights = []
+
+        def recognize(tile_png, **kwargs):
+            self.assertEqual(kwargs["unclip_ratio"], 1.8)
+            with Image.open(BytesIO(tile_png)) as tile:
+                tile_heights.append(tile.height)
+            if len(tile_heights) == 1:
+                return (
+                    [
+                        ([[10, 200], [500, 200], [500, 240], [10, 240]], "第一行。", 0.98),
+                        ([[10, 1500], [500, 1500], [500, 1540], [10, 1540]], "重叠行。", 0.91),
+                    ],
+                    None,
+                )
+            return (
+                [
+                    ([[10, 60], [500, 60], [500, 100], [10, 100]], "重叠行。", 0.96),
+                    ([[10, 1000], [500, 1000], [500, 1040], [10, 1040]], "最后一行。", 0.97),
+                ],
+                None,
+            )
+
+        controller._ocr_engine = Mock(side_effect=recognize)
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(tile_heights, [1600, 1560])
+        self.assertEqual(lines, ["第一行。", "重叠行。", "最后一行。"])
+
+    def test_ocr_retries_and_replaces_a_low_confidence_line(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.screenshot.return_value = png_bytes()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [([[20, 180], [500, 180], [500, 230], [20, 230]], "一个错宇。", 0.61)],
+                    None,
+                ),
+                (
+                    [([[10, 10], [700, 10], [700, 110], [10, 110]], "一个错字。", 0.96)],
+                    None,
+                ),
+            ]
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["一个错字。"])
+        self.assertEqual(controller._ocr_engine.call_count, 2)
+
+    def test_ocr_keeps_original_when_retry_has_lower_confidence(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.screenshot.return_value = png_bytes()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [([[20, 180], [500, 180], [500, 230], [20, 230]], "保留原文。", 0.61)],
+                    None,
+                ),
+                (
+                    [([[10, 10], [700, 10], [700, 110], [10, 110]], "更差结果。", 0.55)],
+                    None,
+                ),
+            ]
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["保留原文。"])
+        self.assertEqual(controller._ocr_engine.call_count, 2)
 
     def test_next_and_previous_chapter_use_adjacent_catalog_items(self):
         controller, _ = self.make_connected_controller()

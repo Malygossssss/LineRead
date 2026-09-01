@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from PIL import Image
 
 from text_parser import DEFAULT_MAX_CHARS, ReaderSource, parse_text
 
@@ -16,6 +20,13 @@ WEREAD_HOME_URL = "https://weread.qq.com/"
 WEREAD_READER_PATH = "/web/reader/"
 CATALOG_CHAPTER_PREFIX = "catalog:"
 OCR_CANVAS_HEADER_PX = 70
+OCR_DEVICE_SCALE_FACTOR = 2
+OCR_TILE_HEIGHT_PX = 1600
+OCR_TILE_OVERLAP_PX = 160
+OCR_DETECTION_UNCLIP_RATIO = 1.8
+OCR_LOW_CONFIDENCE = 0.82
+OCR_RETRY_SCALE = 2
+OCR_RETRY_PADDING_PX = 12
 
 
 class WeReadError(RuntimeError):
@@ -32,6 +43,18 @@ class WeReadChapter:
     chapter_title: str
     chapter_url: str
     units: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _OcrLine:
+    """One OCR result positioned in full-screenshot pixel coordinates."""
+
+    top: float
+    left: float
+    bottom: float
+    right: float
+    text: str
+    confidence: float
 
 
 def default_profile_dir() -> Path:
@@ -246,6 +269,7 @@ class WeReadController:
         options = {
             "headless": False,
             "viewport": {"width": 1280, "height": 900},
+            "device_scale_factor": OCR_DEVICE_SCALE_FACTOR,
         }
         chromium_error: Exception | None = None
         try:
@@ -363,31 +387,31 @@ class WeReadController:
         canvas_locator = self.page.locator(".readerChapterContent canvas")
         if canvas_locator.count() == 0:
             raise WeReadError("当前章节既没有正文 DOM，也没有可识别的 Canvas。")
-        screenshot = canvas_locator.first.screenshot(type="png")
         try:
-            result = self._get_ocr_engine()(screenshot)
+            screenshot = canvas_locator.first.screenshot(type="png", scale="device")
+            engine = self._get_ocr_engine()
+            lines: list[_OcrLine] = []
+            with Image.open(BytesIO(screenshot)) as source:
+                source.load()
+                for tile_top, tile in _ocr_tiles(source):
+                    try:
+                        result = engine(
+                            _image_png(tile),
+                            unclip_ratio=OCR_DETECTION_UNCLIP_RATIO,
+                        )
+                        tile_lines = _ocr_lines(result, y_offset=tile_top)
+                        for line in tile_lines:
+                            if line.top < OCR_CANVAS_HEADER_PX * OCR_DEVICE_SCALE_FACTOR:
+                                continue
+                            if line.confidence < OCR_LOW_CONFIDENCE:
+                                line = _retry_ocr_line(engine, tile, tile_top, line)
+                            lines.append(line)
+                    finally:
+                        tile.close()
+            lines = _deduplicate_ocr_lines(lines)
         except Exception as exc:
             raise WeReadError("本地 OCR 无法识别当前章节。") from exc
-
-        recognized = result[0] if isinstance(result, tuple) else result
-        lines: list[tuple[float, float, str]] = []
-        if isinstance(recognized, list):
-            for item in recognized:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                box, value = item[0], _text(item[1])
-                if not value or not isinstance(box, (list, tuple)):
-                    continue
-                points = [point for point in box if isinstance(point, (list, tuple)) and len(point) >= 2]
-                if not points:
-                    continue
-                top = min(float(point[1]) for point in points)
-                left = min(float(point[0]) for point in points)
-                if top < OCR_CANVAS_HEADER_PX:
-                    continue
-                lines.append((top, left, value))
-        lines.sort(key=lambda item: (item[0], item[1]))
-        texts = [value for _, _, value in lines]
+        texts = [line.text for line in lines]
         if not texts:
             raise WeReadError("本地 OCR 没有识别到当前章节正文。")
         return texts
@@ -407,6 +431,147 @@ class WeReadController:
                 "项目虚拟环境尚未安装中文 OCR，请重新执行 pip install -r requirements.txt。"
             ) from exc
         return self._ocr_engine
+
+
+def _ocr_tiles(source: Image.Image) -> Iterator[tuple[int, Image.Image]]:
+    """Yield overlapping vertical crops without changing browser scroll state."""
+
+    if source.width <= 0 or source.height <= 0:
+        return
+    top = 0
+    while top < source.height:
+        bottom = min(top + OCR_TILE_HEIGHT_PX, source.height)
+        yield top, source.crop((0, top, source.width, bottom))
+        if bottom >= source.height:
+            break
+        top = bottom - OCR_TILE_OVERLAP_PX
+
+
+def _image_png(image: Image.Image) -> bytes:
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _ocr_lines(result: Any, *, y_offset: int = 0) -> list[_OcrLine]:
+    recognized = result[0] if isinstance(result, tuple) else result
+    if not isinstance(recognized, list):
+        return []
+
+    lines: list[_OcrLine] = []
+    for item in recognized:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        box, value = item[0], _text(item[1])
+        if not value or not isinstance(box, (list, tuple)):
+            continue
+        try:
+            points = [
+                (float(point[0]), float(point[1]))
+                for point in box
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ]
+        except (TypeError, ValueError):
+            continue
+        if not points:
+            continue
+        score = item[2] if len(item) >= 3 else 1.0
+        confidence = float(score) if isinstance(score, (int, float)) else 1.0
+        lines.append(
+            _OcrLine(
+                top=min(point[1] for point in points) + y_offset,
+                left=min(point[0] for point in points),
+                bottom=max(point[1] for point in points) + y_offset,
+                right=max(point[0] for point in points),
+                text=value,
+                confidence=confidence,
+            )
+        )
+    return lines
+
+
+def _retry_ocr_line(
+    engine: Any,
+    tile: Image.Image,
+    tile_top: int,
+    original: _OcrLine,
+) -> _OcrLine:
+    """Retry one uncertain line and retain the original on any regression."""
+
+    left = max(0, int(original.left) - OCR_RETRY_PADDING_PX)
+    top = max(0, int(original.top - tile_top) - OCR_RETRY_PADDING_PX)
+    right = min(tile.width, int(original.right + 1) + OCR_RETRY_PADDING_PX)
+    bottom = min(
+        tile.height,
+        int(original.bottom - tile_top + 1) + OCR_RETRY_PADDING_PX,
+    )
+    if right <= left or bottom <= top:
+        return original
+
+    try:
+        cropped = tile.crop((left, top, right, bottom))
+        enlarged = cropped.resize(
+            (cropped.width * OCR_RETRY_SCALE, cropped.height * OCR_RETRY_SCALE),
+            Image.Resampling.LANCZOS,
+        )
+        retry_lines = _ocr_lines(
+            engine(
+                _image_png(enlarged),
+                unclip_ratio=OCR_DETECTION_UNCLIP_RATIO,
+            )
+        )
+    except Exception:
+        return original
+    finally:
+        if "cropped" in locals():
+            cropped.close()
+        if "enlarged" in locals():
+            enlarged.close()
+
+    if len(retry_lines) != 1:
+        return original
+    candidate = retry_lines[0]
+    if candidate.confidence <= original.confidence:
+        return original
+    return _OcrLine(
+        top=original.top,
+        left=original.left,
+        bottom=original.bottom,
+        right=original.right,
+        text=candidate.text,
+        confidence=candidate.confidence,
+    )
+
+
+def _deduplicate_ocr_lines(lines: list[_OcrLine]) -> list[_OcrLine]:
+    unique: list[_OcrLine] = []
+    for line in sorted(lines, key=lambda item: (item.top, item.left)):
+        duplicate_index = next(
+            (
+                index
+                for index, existing in enumerate(unique)
+                if _same_detected_line(existing, line)
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            unique.append(line)
+        elif line.confidence > unique[duplicate_index].confidence:
+            unique[duplicate_index] = line
+    return sorted(unique, key=lambda item: (item.top, item.left))
+
+
+def _same_detected_line(first: _OcrLine, second: _OcrLine) -> bool:
+    vertical_overlap = min(first.bottom, second.bottom) - max(first.top, second.top)
+    horizontal_overlap = min(first.right, second.right) - max(first.left, second.left)
+    min_height = min(first.bottom - first.top, second.bottom - second.top)
+    min_width = min(first.right - first.left, second.right - second.left)
+    return (
+        min_height > 0
+        and min_width > 0
+        and vertical_overlap >= min_height * 0.5
+        and horizontal_overlap >= min_width * 0.5
+    )
 
 
 class WeReadSource(ReaderSource):
