@@ -9,6 +9,7 @@ from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QDialog
 
 from reader_window import DesktopReader
+from weread_source import WeReadChapter
 
 
 class DesktopReaderTests(unittest.TestCase):
@@ -202,14 +203,143 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertEqual(reader.opacity_wheel_modifier, "Alt")
 
     def test_context_menu_contains_open_settings_and_exit(self):
-        reader = self.make_reader()
+        reader = DesktopReader(
+            ["第一条。", "第二条。"],
+            self.make_state(),
+            open_weread_callback=lambda parent, saved: self._chapter(
+                "book-1", "chapter-1", ["正文。"]
+            ),
+        )
         self.addCleanup(reader.close)
 
         menu = reader.create_context_menu()
         self.addCleanup(menu.close)
         labels = [action.text() for action in menu.actions() if not action.isSeparator()]
 
-        self.assertEqual(labels, ["打开 TXT…", "设置…", "退出"])
+        self.assertEqual(labels, ["打开文件", "阅读详情", "设置", "退出"])
+
+    def test_exported_weread_state_contains_book_chapter_and_line_index(self):
+        chapter = self._chapter("book-1", "chapter-6", ["甲。", "乙。", "丙。"])
+        reader = DesktopReader(
+            chapter.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=chapter,
+        )
+        self.addCleanup(reader.close)
+        reader.index = 2
+
+        state = reader.get_state()
+
+        self.assertEqual(state["source"], "weread")
+        self.assertEqual(
+            state["weread"]["books"]["book-1"],
+            {
+                "book_id": "book-1",
+                "book_title": "测试书",
+                "chapter_id": "chapter-6",
+                "chapter_title": "第六章",
+                "chapter_url": "https://weread.qq.com/web/reader/book-1-chapter-6",
+                "line_index": 2,
+            },
+        )
+
+    def test_weread_menu_contains_book_and_chapter_runtime_actions(self):
+        chapter = self._chapter("book-1", "chapter-1", ["第一行。", "第二行。"])
+        reader = DesktopReader(
+            chapter.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=chapter,
+            open_weread_callback=lambda parent, saved: chapter,
+            switch_book_callback=lambda parent, current: chapter,
+            chapter_change_callback=lambda parent, direction: chapter,
+        )
+        self.addCleanup(reader.close)
+
+        menu = reader.create_context_menu()
+        self.addCleanup(menu.close)
+        labels = [action.text() for action in menu.actions() if not action.isSeparator()]
+
+        self.assertEqual(
+            labels,
+            ["打开微信读书", "切换书籍", "上一章", "下一章", "阅读详情", "设置", "退出"],
+        )
+
+    def test_weread_details_show_requested_metadata_and_progress(self):
+        chapter = self._chapter("book-1", "chapter-6", ["甲。", "乙。", "丙。"])
+        reader = DesktopReader(
+            chapter.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=chapter,
+        )
+        self.addCleanup(reader.close)
+        reader.index = 1
+
+        self.assertEqual(
+            reader.reading_detail_lines(),
+            [
+                "当前来源：微信读书",
+                "当前书籍：《测试书》",
+                "当前章节：第六章",
+                "当前章节进度：2 / 3 行",
+            ],
+        )
+
+    def test_end_of_weread_chapter_automatically_loads_next_chapter(self):
+        first = self._chapter("book-1", "chapter-1", ["末行。"])
+        second = self._chapter("book-1", "chapter-2", ["新章第一行。", "新章第二行。"])
+        calls = []
+        reader = DesktopReader(
+            first.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=first,
+            chapter_change_callback=lambda parent, direction: calls.append(direction) or second,
+        )
+        self.addCleanup(reader.close)
+
+        reader.navigate(1)
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(reader.chapter_id, "chapter-2")
+        self.assertEqual(reader.index, 0)
+        self.assertEqual(reader.label.text(), "新章第一行。")
+
+    def test_switching_books_restores_saved_chapter_line(self):
+        first = self._chapter("book-1", "chapter-1", ["一。", "二。"])
+        second = self._chapter("book-2", "chapter-8", ["甲。", "乙。", "丙。"])
+        state = self.make_state(
+            source="weread",
+            weread={
+                "active_book_id": "book-1",
+                "books": {
+                    "book-2": {
+                        "book_id": "book-2",
+                        "book_title": "测试书",
+                        "chapter_id": "chapter-8",
+                        "chapter_title": "第六章",
+                        "chapter_url": second.chapter_url,
+                        "line_index": 2,
+                    }
+                },
+            },
+        )
+        reader = DesktopReader(
+            first.units,
+            state,
+            source_type="weread",
+            weread_chapter=first,
+            switch_book_callback=lambda parent, current: second,
+        )
+        self.addCleanup(reader.close)
+
+        reader.switch_weread_book()
+
+        self.assertEqual(reader.book_id, "book-2")
+        self.assertEqual(reader.index, 2)
+        self.assertEqual(reader.label.text(), "丙。")
 
     def test_open_text_file_replaces_units_resets_index_and_saves(self):
         saved_states = []
@@ -289,6 +419,32 @@ class DesktopReaderTests(unittest.TestCase):
             modifiers,
             Qt.ScrollPhase.NoScrollPhase,
             False,
+        )
+
+    @staticmethod
+    def make_state(**overrides):
+        state = {
+            "index": 0,
+            "x": 100,
+            "y": 80,
+            "width": 900,
+            "font_size": 14,
+            "opacity": 0.85,
+            "shortcuts": {"font_wheel": "Ctrl", "opacity_wheel": "Shift"},
+        }
+        state.update(overrides)
+        return state
+
+    @staticmethod
+    def _chapter(book_id, chapter_id, units):
+        chapter_number = "第六章" if chapter_id == "chapter-6" else chapter_id
+        return WeReadChapter(
+            book_id=book_id,
+            book_title="测试书",
+            chapter_id=chapter_id,
+            chapter_title=chapter_number,
+            chapter_url=f"https://weread.qq.com/web/reader/{book_id}-{chapter_id}",
+            units=tuple(units),
         )
 
 

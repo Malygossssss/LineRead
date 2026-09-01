@@ -1,5 +1,5 @@
+.venv/
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.venv/
-reader_preview.png
+.weread-browser/
+config.json

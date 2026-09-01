@@ -60,6 +60,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "nested" / "config.json"
             state = {
+                "source": "weread",
                 "file": "D:/books/example.txt",
                 "index": 1837,
                 "x": 400,
@@ -71,12 +72,65 @@ class ConfigTests(unittest.TestCase):
                     "font_wheel": "Alt",
                     "opacity_wheel": "Ctrl",
                 },
+                "weread": {
+                    "active_book_id": "book-1",
+                    "books": {
+                        "book-1": {
+                            "book_id": "book-1",
+                            "book_title": "示例书",
+                            "chapter_id": "chapter-8",
+                            "chapter_title": "第八章",
+                            "chapter_url": "https://weread.qq.com/web/reader/book-1/chapter-8",
+                            "line_index": 132,
+                        }
+                    },
+                },
             }
 
             save_config(state, path)
 
             self.assertEqual(load_config(path), state)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
+
+    def test_invalid_weread_state_is_safely_discarded(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "source": "browser-cache",
+                        "weread": {
+                            "active_book_id": "missing",
+                            "books": {
+                                "bad": {"chapter_id": ""},
+                                "book-2": {
+                                    "book_id": "book-2",
+                                    "chapter_id": "chapter-2",
+                                    "line_index": -7,
+                                    "book_title": 99,
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_config(path)
+
+            self.assertEqual(loaded["source"], "txt")
+            self.assertEqual(loaded["weread"]["active_book_id"], "")
+            self.assertEqual(
+                loaded["weread"]["books"]["book-2"],
+                {
+                    "book_id": "book-2",
+                    "book_title": "",
+                    "chapter_id": "chapter-2",
+                    "chapter_title": "",
+                    "chapter_url": "",
+                    "line_index": 0,
+                },
+            )
 
     def test_invalid_and_conflicting_shortcuts_are_repaired(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
