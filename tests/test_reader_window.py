@@ -201,6 +201,83 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertEqual(reader.font_wheel_modifier, "Shift")
         self.assertEqual(reader.opacity_wheel_modifier, "Alt")
 
+    def test_context_menu_contains_open_settings_and_exit(self):
+        reader = self.make_reader()
+        self.addCleanup(reader.close)
+
+        menu = reader.create_context_menu()
+        self.addCleanup(menu.close)
+        labels = [action.text() for action in menu.actions() if not action.isSeparator()]
+
+        self.assertEqual(labels, ["打开 TXT…", "设置…", "退出"])
+
+    def test_open_text_file_replaces_units_resets_index_and_saves(self):
+        saved_states = []
+        callback_calls = []
+
+        def choose_file(parent, current_file):
+            callback_calls.append((parent, current_file))
+            return "D:/books/new.txt", ["新书第一条。", "新书第二条。"]
+
+        reader = DesktopReader(
+            ["旧书第一条。", "旧书第二条。"],
+            {
+                "index": 1,
+                "x": 100,
+                "y": 80,
+                "width": 900,
+                "font_size": 14,
+                "opacity": 0.85,
+                "shortcuts": {
+                    "font_wheel": "Ctrl",
+                    "opacity_wheel": "Shift",
+                },
+            },
+            file_path="D:/books/old.txt",
+            save_callback=saved_states.append,
+            open_file_callback=choose_file,
+        )
+        self.addCleanup(reader.close)
+
+        reader.open_text_file()
+
+        self.assertEqual(callback_calls, [(reader, "D:/books/old.txt")])
+        self.assertEqual(reader.file_path, "D:/books/new.txt")
+        self.assertEqual(reader.index, 0)
+        self.assertEqual(reader.label.text(), "新书第一条。")
+        self.assertEqual(len(saved_states), 1)
+        self.assertEqual(saved_states[0]["file"], "D:/books/new.txt")
+        self.assertEqual(saved_states[0]["index"], 0)
+
+    def test_cancel_open_text_file_keeps_current_content(self):
+        saved_states = []
+        reader = DesktopReader(
+            ["旧书第一条。", "旧书第二条。"],
+            {
+                "index": 1,
+                "x": 100,
+                "y": 80,
+                "width": 900,
+                "font_size": 14,
+                "opacity": 0.85,
+                "shortcuts": {
+                    "font_wheel": "Ctrl",
+                    "opacity_wheel": "Shift",
+                },
+            },
+            file_path="D:/books/old.txt",
+            save_callback=saved_states.append,
+            open_file_callback=lambda parent, current: None,
+        )
+        self.addCleanup(reader.close)
+
+        reader.open_text_file()
+
+        self.assertEqual(reader.file_path, "D:/books/old.txt")
+        self.assertEqual(reader.index, 1)
+        self.assertEqual(reader.label.text(), "旧书第二条。")
+        self.assertEqual(saved_states, [])
+
     @staticmethod
     def _wheel_event(x=0, y=0, modifiers=Qt.KeyboardModifier.NoModifier):
         return QWheelEvent(

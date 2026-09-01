@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
 
 from config import CONFIG_PATH, load_config, save_config
 from reader_window import DesktopReader
@@ -52,9 +52,40 @@ def main() -> int:
         state,
         file_path=absolute_path,
         save_callback=lambda current: save_config(current, CONFIG_PATH),
+        open_file_callback=select_txt_file,
     )
     reader.show()
     return app.exec()
+
+
+def select_txt_file(
+    parent: QWidget | None,
+    current_file: str,
+) -> tuple[str, list[str]] | None:
+    """Choose and load a UTF-8 TXT, retrying after readable load errors."""
+
+    initial_directory = ""
+    if current_file:
+        initial_directory = str(Path(current_file).expanduser().parent)
+
+    while True:
+        selected, _ = QFileDialog.getOpenFileName(
+            parent,
+            "打开 UTF-8 TXT 文件",
+            initial_directory,
+            "Text files (*.txt)",
+        )
+        if not selected:
+            return None
+
+        path = Path(selected)
+        try:
+            units = TxtSource(path).get_units()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(parent, "无法打开 TXT", str(exc))
+            initial_directory = str(path.parent)
+            continue
+        return str(path.resolve()), units
 
 
 def _same_file(left: str, right: str) -> bool:

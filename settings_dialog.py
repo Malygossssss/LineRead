@@ -51,7 +51,7 @@ class SettingsDialog(QDialog):
             "• 普通滚轮：上一条 / 下一条\n"
             "• 修饰键 + 滚轮：调整字号或透明度\n"
             "• 按住左键：拖动悬浮窗\n"
-            "• 右键：打开此设置页\n"
+            "• 右键：打开菜单（换书 / 设置 / 退出）\n"
             "• Alt + F4：退出并保存"
         )
         instructions.setWordWrap(True)

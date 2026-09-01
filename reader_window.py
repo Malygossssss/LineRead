@@ -46,15 +46,19 @@ class DesktopReader(QWidget):
         *,
         file_path: str = "",
         save_callback: Callable[[dict[str, Any]], None] | None = None,
+        open_file_callback: (
+            Callable[[QWidget, str], tuple[str, Sequence[str]] | None] | None
+        ) = None,
     ) -> None:
         super().__init__()
 
-        self.units = [self._single_line(unit) for unit in units if unit.strip()]
+        self.units = self._normalize_units(units)
         if not self.units:
             raise ValueError("没有可显示的阅读内容。")
 
         self.file_path = file_path
         self.save_callback = save_callback
+        self.open_file_callback = open_file_callback
         self.index = max(0, min(int(state.get("index", 0)), len(self.units) - 1))
         self.font_size = max(
             MIN_FONT_SIZE,
@@ -78,7 +82,7 @@ class DesktopReader(QWidget):
                 "Shift" if self.font_wheel_modifier != "Shift" else "Ctrl"
             )
         self._hovered = False
-        self._settings_open = False
+        self._dialog_open = False
         self._drag_offset: QPoint | None = None
 
         flags = (
@@ -181,7 +185,7 @@ class DesktopReader(QWidget):
                 self.opacity_wheel_modifier = opacity_modifier
 
         self._apply_font()
-        if self._hovered or self._settings_open:
+        if self._hovered or self._dialog_open:
             self.setWindowOpacity(self.visible_opacity)
         if persist:
             self._persist_state()
@@ -190,15 +194,51 @@ class DesktopReader(QWidget):
         """Open the modal settings dialog from the reader context menu."""
 
         dialog = SettingsDialog(self.get_state(), self)
-        self._settings_open = True
+        self._dialog_open = True
         self.setWindowOpacity(self.visible_opacity)
         try:
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.apply_settings(dialog.get_settings())
         finally:
-            self._settings_open = False
+            self._dialog_open = False
             if not self.underMouse():
                 self.setWindowOpacity(HIDDEN_OPACITY)
+
+    def open_text_file(self) -> None:
+        """Ask the injected source callback for new units and display them."""
+
+        if self.open_file_callback is None:
+            return
+        self._dialog_open = True
+        self.setWindowOpacity(self.visible_opacity)
+        try:
+            result = self.open_file_callback(self, self.file_path)
+            if result is not None:
+                file_path, units = result
+                self.replace_content(units, file_path)
+        finally:
+            self._dialog_open = False
+            if not self.underMouse():
+                self.setWindowOpacity(HIDDEN_OPACITY)
+
+    def replace_content(
+        self,
+        units: Sequence[str],
+        file_path: str,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Replace source-agnostic content and restart at the first unit."""
+
+        normalized_units = self._normalize_units(units)
+        if not normalized_units:
+            raise ValueError("没有可显示的阅读内容。")
+        self.units = normalized_units
+        self.file_path = file_path
+        self.index = 0
+        self._show_current_unit()
+        if persist:
+            self._persist_state()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 (Qt API)
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -217,16 +257,24 @@ class DesktopReader(QWidget):
         event.accept()
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802
+        menu = self.create_context_menu()
+        menu.exec(event.globalPos())
+        event.accept()
+
+    def create_context_menu(self) -> QMenu:
+        """Build the reader's right-click menu for display or testing."""
+
         menu = QMenu(self)
+        open_action = menu.addAction("打开 TXT…")
+        open_action.setEnabled(self.open_file_callback is not None)
+        open_action.triggered.connect(self.open_text_file)
+        menu.addSeparator()
         settings_action = menu.addAction("设置…")
+        settings_action.triggered.connect(self.open_settings)
         menu.addSeparator()
         exit_action = menu.addAction("退出")
-        selected = menu.exec(event.globalPos())
-        if selected is settings_action:
-            self.open_settings()
-        elif selected is exit_action:
-            self.close()
-        event.accept()
+        exit_action.triggered.connect(self.close)
+        return menu
 
     def enterEvent(self, event: QEnterEvent) -> None:  # noqa: N802 (Qt API)
         self._hovered = True
@@ -235,7 +283,7 @@ class DesktopReader(QWidget):
 
     def leaveEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self._hovered = False
-        if not self._settings_open:
+        if not self._dialog_open:
             self.setWindowOpacity(HIDDEN_OPACITY)
         super().leaveEvent(event)
 
@@ -284,6 +332,10 @@ class DesktopReader(QWidget):
     @staticmethod
     def _valid_modifier(value: Any, fallback: str) -> str:
         return value if value in ALLOWED_WHEEL_MODIFIERS else fallback
+
+    @classmethod
+    def _normalize_units(cls, units: Sequence[str]) -> list[str]:
+        return [cls._single_line(unit) for unit in units if unit.strip()]
 
     @staticmethod
     def _single_line(unit: str) -> str:
