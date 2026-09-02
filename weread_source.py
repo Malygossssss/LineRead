@@ -394,14 +394,17 @@ class WeReadController:
             button.first.click()
             self.page.wait_for_function(
                 _CURRENT_PAGE_CHANGED,
-                before,
+                arg=before,
                 polling=100,
                 timeout=20_000,
             )
             self.page.wait_for_timeout(250)
             self._wait_for_chapter_render()
         except Exception as exc:
-            raise WeReadError(f"微信读书{label}失败，请稍后重试。") from exc
+            raise WeReadError(
+                f"微信读书{label}失败，请稍后重试。\n"
+                f"底层错误：{_error_summary(exc)}"
+            ) from exc
 
     def _page_signature(self) -> str:
         value = self.page.evaluate(_EXTRACT_CURRENT_PAGE_SIGNATURE)

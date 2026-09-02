@@ -567,7 +567,8 @@ class WeReadControllerChapterTests(unittest.TestCase):
         )
         button.click.assert_called_once_with()
         page_change_wait = page.wait_for_function.call_args_list[0]
-        self.assertEqual(page_change_wait.args[1], "page-before")
+        self.assertEqual(len(page_change_wait.args), 1)
+        self.assertEqual(page_change_wait.kwargs["arg"], "page-before")
         self.assertEqual(page_change_wait.kwargs["timeout"], 20_000)
 
     def test_page_turn_reports_unavailable_boundary(self):
