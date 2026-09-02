@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QDialog
 
@@ -46,6 +46,41 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertTrue(flags & Qt.WindowType.WindowStaysOnTopHint)
         self.assertTrue(flags & Qt.WindowType.Tool)
         self.assertTrue(reader.testAttribute(Qt.WidgetAttribute.WA_QuitOnClose))
+
+    def test_restored_position_is_clamped_to_the_available_desktop(self):
+        available = QRect(0, 0, 1440, 852)
+
+        with patch(
+            "reader_window._available_screen_geometries",
+            return_value=(available,),
+        ):
+            reader = self.make_reader(x=-94, y=856)
+        self.addCleanup(reader.close)
+
+        self.assertEqual(reader.pos().x(), 0)
+        self.assertEqual(reader.pos().y(), available.bottom() - reader.height() + 1)
+
+    def test_restore_and_activate_recovers_a_window_moved_offscreen(self):
+        available = QRect(0, 0, 1440, 852)
+        reader = self.make_reader()
+        self.addCleanup(reader.close)
+        reader.move(-1200, 1000)
+
+        with patch(
+            "reader_window._available_screen_geometries",
+            return_value=(available,),
+        ):
+            reader.restore_and_activate()
+
+        self.assertEqual(
+            reader.pos(),
+            QPoint(0, available.bottom() - reader.height() + 1),
+        )
+        self.assertAlmostEqual(
+            reader.windowOpacity(),
+            reader.visible_opacity,
+            delta=1 / 255,
+        )
 
     def test_navigation_stays_within_bounds(self):
         reader = self.make_reader(index=0)

@@ -26,10 +26,12 @@ class StartupTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["main.py", "D:/books/ignored.txt"]),
             patch("main.QApplication", return_value=app),
+            patch("main.SingleInstanceGuard") as guard_type,
             patch("main.load_config", return_value=state),
             patch("main.WeReadIntegration") as integration_type,
             patch("main.DesktopReader") as reader_type,
         ):
+            guard_type.return_value.start.return_value = True
             integration = integration_type.return_value
             reader = reader_type.return_value
 
@@ -43,6 +45,26 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn("open_file_callback", reader_type.call_args.kwargs)
         reader.set_loading_status.assert_called_once_with("正在连接微信读书…")
         reader.show.assert_called_once()
+        guard_type.return_value.activation_requested.connect.assert_called_once_with(
+            reader.restore_and_activate
+        )
+        guard_type.return_value.close.assert_called_once_with()
+
+    def test_second_launch_notifies_existing_instance_and_exits(self):
+        app = Mock()
+
+        with (
+            patch("main.QApplication", return_value=app),
+            patch("main.SingleInstanceGuard") as guard_type,
+            patch("main.DesktopReader") as reader_type,
+        ):
+            guard_type.return_value.start.return_value = False
+
+            result = main()
+
+        self.assertEqual(result, 0)
+        reader_type.assert_not_called()
+        app.exec.assert_not_called()
 
 
 class FakeWeReadController:

@@ -6,6 +6,8 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
+from hashlib import sha256
+from pathlib import Path
 from threading import Event
 from time import monotonic
 from typing import Any, Mapping
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from config import CONFIG_PATH, load_config, save_config
 from reader_window import DesktopReader
+from single_instance import SingleInstanceGuard
 from weread_source import WeReadChapter, WeReadController, WeReadError, WeReadSource
 
 
@@ -22,6 +25,9 @@ STARTUP_CONNECTING_TEXT = "正在连接微信读书…"
 STARTUP_LOGIN_TEXT = "等待登录…"
 STARTUP_BOOK_TEXT = "等待选书…"
 STARTUP_RENDERING_TEXT = "文本渲染中…"
+INSTANCE_KEY = "LineRead-" + sha256(
+    str(Path(__file__).resolve()).casefold().encode("utf-8")
+).hexdigest()[:16]
 
 
 class WeReadIntegration(QObject):
@@ -293,29 +299,41 @@ def main() -> int:
     app.setApplicationName("单行阅读")
     app.setQuitOnLastWindowClosed(True)
 
-    state = load_config(CONFIG_PATH)
-    integration = WeReadIntegration()
-    reader = DesktopReader(
-        [STARTUP_CONNECTING_TEXT],
-        state,
-        file_path="",
-        save_callback=lambda current: save_config(current, CONFIG_PATH),
-        source_type="weread",
-        open_weread_callback=integration.open,
-        switch_book_callback=integration.switch_book,
-        chapter_change_callback=integration.change_chapter,
-        chapter_select_callback=integration.select_chapter,
-        shutdown_callback=integration.close,
-    )
-    reader.set_loading_status(STARTUP_CONNECTING_TEXT)
-    integration.startup_status.connect(reader.set_loading_status)
-    integration.startup_ready.connect(reader.load_weread_chapter)
-    integration.startup_failed.connect(reader.show_loading_error)
-    integration.chapter_ready.connect(reader.finish_chapter_change)
-    integration.chapter_failed.connect(reader.fail_chapter_change)
-    reader.show()
-    integration.start(state.get("weread"))
-    return app.exec()
+    instance_guard = SingleInstanceGuard(INSTANCE_KEY)
+    try:
+        if not instance_guard.start():
+            return 0
+    except RuntimeError as exc:
+        QMessageBox.critical(None, "LineRead 启动失败", str(exc))
+        return 1
+
+    try:
+        state = load_config(CONFIG_PATH)
+        integration = WeReadIntegration()
+        reader = DesktopReader(
+            [STARTUP_CONNECTING_TEXT],
+            state,
+            file_path="",
+            save_callback=lambda current: save_config(current, CONFIG_PATH),
+            source_type="weread",
+            open_weread_callback=integration.open,
+            switch_book_callback=integration.switch_book,
+            chapter_change_callback=integration.change_chapter,
+            chapter_select_callback=integration.select_chapter,
+            shutdown_callback=integration.close,
+        )
+        reader.set_loading_status(STARTUP_CONNECTING_TEXT)
+        integration.startup_status.connect(reader.set_loading_status)
+        integration.startup_ready.connect(reader.load_weread_chapter)
+        integration.startup_failed.connect(reader.show_loading_error)
+        integration.chapter_ready.connect(reader.finish_chapter_change)
+        integration.chapter_failed.connect(reader.fail_chapter_change)
+        instance_guard.activation_requested.connect(reader.restore_and_activate)
+        reader.show()
+        integration.start(state.get("weread"))
+        return app.exec()
+    finally:
+        instance_guard.close()
 
 
 def _error_message(error: BaseException) -> str:

@@ -6,12 +6,13 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import (
     QCloseEvent,
     QContextMenuEvent,
     QEnterEvent,
     QFont,
+    QGuiApplication,
     QMouseEvent,
     QWheelEvent,
 )
@@ -168,7 +169,28 @@ class DesktopReader(QWidget):
         self.move(int(normalized_state.get("x", 400)), int(normalized_state.get("y", 50)))
         self._apply_font()
         self._show_current_unit()
+        self.ensure_visible()
         self.setWindowOpacity(HIDDEN_OPACITY)
+
+    def ensure_visible(self) -> None:
+        """Move the complete window into the nearest screen's usable area."""
+
+        position = _clamp_window_position(
+            self.pos(),
+            self.size(),
+            _available_screen_geometries(),
+        )
+        if position != self.pos():
+            self.move(position)
+
+    def restore_and_activate(self) -> None:
+        """Reveal this instance when another launch requests activation."""
+
+        self.ensure_visible()
+        self.showNormal()
+        self.setWindowOpacity(self.visible_opacity)
+        self.raise_()
+        self.activateWindow()
 
     def navigate(self, amount: int) -> None:
         """Move by ``amount`` units while respecting both boundaries."""
@@ -204,7 +226,11 @@ class DesktopReader(QWidget):
 
     def get_state(self, file_path: str | None = None) -> dict[str, Any]:
         self._remember_current_weread_position()
-        position = self.pos()
+        position = _clamp_window_position(
+            self.pos(),
+            self.size(),
+            _available_screen_geometries(),
+        )
         return {
             "source": self.source_type,
             "file": self.file_path if file_path is None else file_path,
@@ -530,6 +556,8 @@ class DesktopReader(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = None
+            self.ensure_visible()
+            self._persist_state()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -666,3 +694,52 @@ class DesktopReader(QWidget):
     @staticmethod
     def _single_line(unit: str) -> str:
         return " ".join(unit.replace("\r", "\n").splitlines()).strip()
+
+
+def _available_screen_geometries() -> tuple[QRect, ...]:
+    return tuple(QRect(screen.availableGeometry()) for screen in QGuiApplication.screens())
+
+
+def _clamp_window_position(
+    position: QPoint,
+    size: QSize,
+    available_geometries: Sequence[QRect],
+) -> QPoint:
+    """Clamp a window to the best matching screen without assuming positive origins."""
+
+    geometries = tuple(
+        QRect(geometry) for geometry in available_geometries if geometry.isValid()
+    )
+    if not geometries:
+        return QPoint(position)
+
+    window = QRect(position, size)
+
+    def overlap_area(geometry: QRect) -> int:
+        overlap = window.intersected(geometry)
+        return overlap.width() * overlap.height() if overlap.isValid() else 0
+
+    target = max(geometries, key=overlap_area)
+    if overlap_area(target) == 0:
+        center = window.center()
+
+        def distance_squared(geometry: QRect) -> int:
+            nearest_x = min(max(center.x(), geometry.left()), geometry.right())
+            nearest_y = min(max(center.y(), geometry.top()), geometry.bottom())
+            return (center.x() - nearest_x) ** 2 + (center.y() - nearest_y) ** 2
+
+        target = min(geometries, key=distance_squared)
+
+    max_x = target.right() - size.width() + 1
+    max_y = target.bottom() - size.height() + 1
+    x = (
+        target.left()
+        if max_x < target.left()
+        else min(max(position.x(), target.left()), max_x)
+    )
+    y = (
+        target.top()
+        if max_y < target.top()
+        else min(max(position.y(), target.top()), max_y)
+    )
+    return QPoint(x, y)
