@@ -1,78 +1,87 @@
 import os
-import tempfile
+import sys
 import unittest
-from pathlib import Path
-from unittest.mock import patch
+from threading import get_ident
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QSignalSpy
 
-from main import WeReadIntegration, select_txt_file
+from main import WeReadIntegration, main
 from weread_source import WeReadChapter, WeReadError
 
 
-class SelectTxtFileTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
+class StartupTests(unittest.TestCase):
+    def test_starts_reader_immediately_and_begins_async_weread_connection(self):
+        state = {
+            "source": "txt",
+            "file": "D:/books/old.txt",
+            "weread": {"active_book_id": "", "books": {}},
+        }
+        app = Mock()
+        app.exec.return_value = 17
 
-    def test_returns_absolute_path_and_parsed_units(self):
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            path = Path(directory) / "book.txt"
-            path.write_text("第一条。第二条！", encoding="utf-8")
+        with (
+            patch.object(sys, "argv", ["main.py", "D:/books/ignored.txt"]),
+            patch("main.QApplication", return_value=app),
+            patch("main.load_config", return_value=state),
+            patch("main.WeReadIntegration") as integration_type,
+            patch("main.DesktopReader") as reader_type,
+        ):
+            integration = integration_type.return_value
+            reader = reader_type.return_value
 
-            with patch(
-                "main.QFileDialog.getOpenFileName",
-                return_value=(str(path), "Text files (*.txt)"),
-            ):
-                result = select_txt_file(None, "")
+            result = main()
 
-            self.assertEqual(result, (str(path.resolve()), ["第一条。", "第二条！"]))
-
-    def test_cancel_returns_none(self):
-        with patch("main.QFileDialog.getOpenFileName", return_value=("", "")):
-            self.assertIsNone(select_txt_file(None, "D:/books/current.txt"))
-
-    def test_invalid_file_shows_error_and_allows_cancel(self):
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            path = Path(directory) / "empty.txt"
-            path.write_text("\n\n", encoding="utf-8")
-
-            with (
-                patch(
-                    "main.QFileDialog.getOpenFileName",
-                    side_effect=[(str(path), "Text files (*.txt)"), ("", "")],
-                ),
-                patch("main.QMessageBox.warning") as warning,
-            ):
-                result = select_txt_file(None, "")
-
-            self.assertIsNone(result)
-            warning.assert_called_once()
-            self.assertIn("没有可阅读内容", warning.call_args.args[2])
+        self.assertEqual(result, 17)
+        integration.open.assert_not_called()
+        integration.start.assert_called_once_with(state["weread"])
+        self.assertEqual(reader_type.call_args.args[0], ["正在连接微信读书…"])
+        self.assertEqual(reader_type.call_args.kwargs["source_type"], "weread")
+        self.assertNotIn("open_file_callback", reader_type.call_args.kwargs)
+        reader.set_loading_status.assert_called_once_with("正在连接微信读书…")
+        reader.show.assert_called_once()
 
 
 class FakeWeReadController:
-    def __init__(self, *, reader_page=True):
+    def __init__(self, *, reader_page=True, readiness_states=None, error=None):
         self.reader_page = reader_page
+        self.readiness_states = list(readiness_states or [])
+        self.error = error
         self.calls = []
+        self.thread_ids = []
+
+    def _record(self, name):
+        self.calls.append(name)
+        self.thread_ids.append(get_ident())
 
     def connect(self):
-        self.calls.append("connect")
+        self._record("connect")
 
     def restore_window(self):
-        self.calls.append("restore")
+        self._record("restore")
 
     def is_reader_page(self):
         return self.reader_page
 
+    def readiness_state(self):
+        self._record("readiness")
+        if self.readiness_states:
+            state = self.readiness_states.pop(0)
+            self.reader_page = state == "reader"
+            return state
+        return "reader" if self.reader_page else "book"
+
     def wait_for_reader(self):
-        self.calls.append("wait")
+        self._record("wait")
         self.reader_page = True
 
     def get_current_chapter(self):
-        self.calls.append("current")
+        self._record("current")
+        if self.error is not None:
+            raise self.error
         return {
             "book_id": "book-1",
             "book_title": "测试书",
@@ -85,8 +94,17 @@ class FakeWeReadController:
     def open_chapter_url(self, url, chapter_id=""):
         self.calls.append(("open_url", url, chapter_id))
 
+    def next_chapter(self):
+        self._record("next")
+
+    def previous_chapter(self):
+        self._record("previous")
+
+    def select_chapter(self, chapter_id):
+        self._record(("select", chapter_id))
+
     def close(self):
-        self.calls.append("close")
+        self._record("close")
 
 
 class WeReadIntegrationTests(unittest.TestCase):
@@ -94,7 +112,7 @@ class WeReadIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_first_connection_prompts_and_waits_for_reader_page(self):
+    def test_open_waits_without_showing_a_login_confirmation_dialog(self):
         controller = FakeWeReadController(reader_page=False)
         integration = WeReadIntegration(controller)
 
@@ -102,8 +120,97 @@ class WeReadIntegrationTests(unittest.TestCase):
             chapter = integration.open(None)
 
         self.assertIsInstance(chapter, WeReadChapter)
-        information.assert_called_once()
+        information.assert_not_called()
         self.assertIn("wait", controller.calls)
+
+    def test_async_startup_emits_login_book_rendering_and_ready_states(self):
+        controller = FakeWeReadController(
+            reader_page=False,
+            readiness_states=["login", "book", "reader"],
+        )
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        status_spy = QSignalSpy(integration.startup_status)
+        ready_spy = QSignalSpy(integration.startup_ready)
+
+        integration.start(None)
+
+        integration._startup_future.result(timeout=1)
+        self.app.processEvents()
+        self.assertEqual(ready_spy.count(), 1)
+        statuses = [status_spy.at(index)[0] for index in range(status_spy.count())]
+        self.assertEqual(
+            statuses,
+            ["正在连接微信读书…", "等待登录…", "等待选书…", "文本渲染中…"],
+        )
+        self.assertIsInstance(ready_spy.at(0)[0], WeReadChapter)
+
+    def test_async_startup_reports_errors_without_a_message_box(self):
+        controller = FakeWeReadController(error=WeReadError("正文读取失败"))
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        failed_spy = QSignalSpy(integration.startup_failed)
+
+        with patch("main.QMessageBox.warning") as warning:
+            integration.start(None)
+            integration._startup_future.result(timeout=1)
+            self.app.processEvents()
+
+        self.assertEqual(failed_spy.at(0)[0], "正文读取失败")
+        warning.assert_not_called()
+
+    def test_chapter_changes_stay_on_the_startup_playwright_thread(self):
+        controller = FakeWeReadController()
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+
+        integration.start(None)
+        integration._startup_future.result(timeout=1)
+        ready_spy = QSignalSpy(integration.chapter_ready)
+
+        accepted = integration.change_chapter(None, 1)
+        integration._chapter_future.result(timeout=1)
+        self.app.processEvents()
+
+        self.assertTrue(accepted)
+        self.assertEqual(ready_spy.count(), 1)
+        self.assertIsInstance(ready_spy.at(0)[0], WeReadChapter)
+        browser_thread_ids = [
+            thread_id
+            for call, thread_id in zip(controller.calls, controller.thread_ids)
+            if call in ("connect", "restore", "readiness", "current", "next")
+        ]
+        self.assertEqual(len(set(browser_thread_ids)), 1)
+
+    def test_direct_chapter_selection_runs_asynchronously(self):
+        controller = FakeWeReadController()
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        ready_spy = QSignalSpy(integration.chapter_ready)
+
+        integration.start(None)
+        integration._startup_future.result(timeout=1)
+        accepted = integration.select_chapter(None, "chapter-6")
+        integration._chapter_future.result(timeout=1)
+        self.app.processEvents()
+
+        self.assertTrue(accepted)
+        self.assertIn(("select", "chapter-6"), controller.calls)
+        self.assertEqual(ready_spy.count(), 1)
+
+    def test_async_chapter_error_is_emitted_without_worker_message_box(self):
+        controller = FakeWeReadController(error=WeReadError("正文读取失败"))
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        failed_spy = QSignalSpy(integration.chapter_failed)
+
+        with patch("main.QMessageBox.warning") as warning:
+            self.assertTrue(integration.change_chapter(None, 1))
+            integration._chapter_future.result(timeout=1)
+            self.app.processEvents()
+
+        self.assertEqual(failed_spy.at(0)[0], "正文读取失败")
+        warning.assert_not_called()
 
     def test_saved_chapter_url_is_restored_for_selected_book(self):
         controller = FakeWeReadController()

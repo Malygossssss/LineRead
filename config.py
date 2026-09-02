@@ -20,7 +20,7 @@ DEFAULT_SHORTCUTS = {
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "source": "txt",
+    "source": "weread",
     "file": "",
     "index": 0,
     "x": 400,

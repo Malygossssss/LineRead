@@ -118,7 +118,7 @@ class ConfigTests(unittest.TestCase):
 
             loaded = load_config(path)
 
-            self.assertEqual(loaded["source"], "txt")
+            self.assertEqual(loaded["source"], "weread")
             self.assertEqual(loaded["weread"]["active_book_id"], "")
             self.assertEqual(
                 loaded["weread"]["books"]["book-2"],

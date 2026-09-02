@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from base64 import b64decode
+from binascii import Error as BinasciiError
 from collections.abc import Iterator
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -27,10 +30,22 @@ OCR_DETECTION_UNCLIP_RATIO = 1.8
 OCR_LOW_CONFIDENCE = 0.82
 OCR_RETRY_SCALE = 2
 OCR_RETRY_PADDING_PX = 12
+OCR_CANVAS_DISCOVERY_WAIT_MS = 500
+OCR_CANVAS_STABLE_PASSES = 8
+OCR_CANVAS_MAX_DISCOVERY_PASSES = 200
 
 
 class WeReadError(RuntimeError):
     """A user-facing WeRead connection or extraction failure."""
+
+
+@dataclass(frozen=True)
+class WeReadCatalogEntry:
+    """One stable, display-ready entry in the current book catalog."""
+
+    chapter_id: str
+    title: str
+    level: int = 1
 
 
 @dataclass(frozen=True)
@@ -43,6 +58,8 @@ class WeReadChapter:
     chapter_title: str
     chapter_url: str
     units: tuple[str, ...]
+    catalog: tuple[WeReadCatalogEntry, ...] = ()
+    catalog_index: int = -1
 
 
 @dataclass(frozen=True)
@@ -128,6 +145,20 @@ class WeReadController:
         except WeReadError:
             return False
 
+    def readiness_state(self) -> str:
+        """Return the visible startup state without reading private browser data."""
+
+        self.connect()
+        if self.is_reader_page():
+            return "reader"
+        try:
+            state = self.page.evaluate(_EXTRACT_READINESS_STATE)
+        except Exception:
+            # Navigation can briefly destroy the JavaScript context. Treat the
+            # transient state as book selection and check again on the next poll.
+            return "book"
+        return state if state in ("login", "book") else "book"
+
     def wait_for_reader(self, timeout_ms: int = 300_000) -> None:
         """Wait until the user has opened a book in the WeRead browser."""
 
@@ -147,14 +178,9 @@ class WeReadController:
         if not self.is_reader_page():
             raise WeReadError("请先在微信读书浏览器中进入一本书。")
         try:
+            self._wait_for_chapter_render()
             self._ensure_vertical_layout()
-            self.page.wait_for_function(
-                """() => {
-                    const chapter = document.querySelector('.readerChapterContent');
-                    return !!chapter && !!chapter.querySelector('canvas, p');
-                }""",
-                timeout=20_000,
-            )
+            self._wait_for_chapter_render()
             catalog_position = self._catalog_position()
             payload = self.page.evaluate(_EXTRACT_CURRENT_CHAPTER)
         except Exception as exc:
@@ -165,11 +191,21 @@ class WeReadController:
             raise WeReadError("微信读书返回了无法识别的章节数据。")
         result = dict(payload)
         result["chapter_id"] = catalog_position["chapter_id"]
+        result["catalog"] = catalog_position["entries"]
+        result["catalog_index"] = catalog_position["index"]
         if catalog_position["title"]:
             result["chapter_title"] = catalog_position["title"]
         paragraphs = result.get("paragraphs")
-        if not isinstance(paragraphs, list) or not any(_text(item) for item in paragraphs):
-            result["paragraphs"] = self._ocr_current_canvas()
+        if (
+            result.get("has_canvas") is True
+            or result.get("uses_visual_renderer") is True
+            or not isinstance(paragraphs, list)
+            or not any(_text(item) for item in paragraphs)
+        ):
+            result["paragraphs"] = _reconcile_visual_rows(
+                self._ocr_current_canvas(),
+                paragraphs,
+            )
         return result
 
     def next_chapter(self) -> None:
@@ -177,6 +213,13 @@ class WeReadController:
 
     def previous_chapter(self) -> None:
         self._change_chapter(-1)
+
+    def select_chapter(self, chapter_id: str) -> None:
+        """Select one catalog chapter by its stable id."""
+
+        if not isinstance(chapter_id, str) or not chapter_id:
+            raise WeReadError("无法识别要打开的章节。")
+        self._select_catalog_chapter(chapter_id)
 
     def restore_window(self) -> None:
         """Bring Chromium forward and best-effort restore a minimized window."""
@@ -215,6 +258,7 @@ class WeReadController:
                     timeout=20_000,
                 )
                 self._select_catalog_chapter(chapter_id)
+            self._wait_for_chapter_render()
         except Exception as exc:
             raise WeReadError("无法恢复保存的微信读书章节。") from exc
 
@@ -312,6 +356,11 @@ class WeReadController:
         )
         self.page.wait_for_timeout(300)
 
+    def _wait_for_chapter_render(self) -> None:
+        """Wait past WeRead's small asynchronous loading shell."""
+
+        self.page.wait_for_function(_CHAPTER_RENDER_READY, timeout=20_000)
+
     def _catalog_position(self) -> Mapping[str, Any]:
         payload = self.page.evaluate(_EXTRACT_CATALOG_POSITION)
         if not isinstance(payload, Mapping):
@@ -366,6 +415,10 @@ class WeReadController:
             raise WeReadError("保存的章节已不在当前目录中。")
 
         target = items.nth(index)
+        if target.evaluate(
+            "node => node.classList.contains('readerCatalog_list_item_selected')"
+        ):
+            return
         if not target.is_visible():
             catalog_button = self.page.locator(".readerControls_item.catalog")
             if catalog_button.count() == 0 or not catalog_button.first.is_visible():
@@ -385,36 +438,127 @@ class WeReadController:
 
     def _ocr_current_canvas(self) -> list[str]:
         canvas_locator = self.page.locator(".readerChapterContent canvas")
-        if canvas_locator.count() == 0:
-            raise WeReadError("当前章节既没有正文 DOM，也没有可识别的 Canvas。")
         try:
-            screenshot = canvas_locator.first.screenshot(type="png", scale="device")
-            engine = self._get_ocr_engine()
-            lines: list[_OcrLine] = []
-            with Image.open(BytesIO(screenshot)) as source:
-                source.load()
-                for tile_top, tile in _ocr_tiles(source):
-                    try:
-                        result = engine(
-                            _image_png(tile),
-                            unclip_ratio=OCR_DETECTION_UNCLIP_RATIO,
-                        )
-                        tile_lines = _ocr_lines(result, y_offset=tile_top)
-                        for line in tile_lines:
-                            if line.top < OCR_CANVAS_HEADER_PX * OCR_DEVICE_SCALE_FACTOR:
-                                continue
-                            if line.confidence < OCR_LOW_CONFIDENCE:
-                                line = _retry_ocr_line(engine, tile, tile_top, line)
-                            lines.append(line)
-                    finally:
-                        tile.close()
-            lines = _deduplicate_ocr_lines(lines)
+            engine: Any = None
+            texts: list[str] = []
+            seen_canvas_hashes: set[bytes] = set()
+            stable_bottom_passes = 0
+            previous_canvas_count = 0
+            previous_extent: tuple[int, int, int] | None = None
+            canvas_coverage_bottom: float | None = None
+            # WeRead can retain the virtualized last-screen nodes after the first
+            # programmatic jump to the top. A second reset lets its scroll handler
+            # discard that stale anchor; otherwise the next small move snaps all
+            # the way back to the chapter bottom and skips the middle.
+            for _reset_pass in range(2):
+                self.page.evaluate(_MOVE_CANVAS_DISCOVERY, "top")
+                self.page.wait_for_timeout(OCR_CANVAS_DISCOVERY_WAIT_MS)
+
+            for discovery_pass in range(OCR_CANVAS_MAX_DISCOVERY_PASSES):
+                canvas_count = canvas_locator.count()
+                if canvas_count and engine is None:
+                    engine = self._get_ocr_engine()
+
+                discovered_canvas = False
+                scan_start = (
+                    max(0, previous_canvas_count - 1)
+                    if canvas_count > previous_canvas_count
+                    else 0
+                )
+                for canvas_index in range(scan_start, canvas_count):
+                    canvas = (
+                        canvas_locator.first
+                        if canvas_index == 0
+                        else canvas_locator.nth(canvas_index)
+                    )
+                    screenshot = _canvas_png(canvas)
+                    screenshot_hash = hashlib.sha256(screenshot).digest()
+                    if screenshot_hash in seen_canvas_hashes:
+                        continue
+                    first_canvas_image = not seen_canvas_hashes
+                    seen_canvas_hashes.add(screenshot_hash)
+                    lines = _ocr_canvas_lines(
+                        engine,
+                        screenshot,
+                        ignore_header=first_canvas_image,
+                    )
+                    text_chunk = tuple(line.text for line in lines)
+                    if not text_chunk:
+                        continue
+                    if _extend_with_boundary_overlap(texts, text_chunk):
+                        discovered_canvas = True
+
+                positioned_chunk = tuple(
+                    self._positioned_text_rows(canvas_coverage_bottom)
+                )
+                if canvas_coverage_bottom is None:
+                    canvas_coverage_bottom = getattr(
+                        self,
+                        "_last_positioned_canvas_bottom",
+                        None,
+                    )
+                if positioned_chunk and _extend_with_boundary_overlap(
+                    texts,
+                    positioned_chunk,
+                ):
+                    discovered_canvas = True
+
+                scroll_state = self.page.evaluate(_MOVE_CANVAS_DISCOVERY, "next")
+                self.page.wait_for_timeout(OCR_CANVAS_DISCOVERY_WAIT_MS)
+                at_bottom = bool(
+                    isinstance(scroll_state, Mapping)
+                    and scroll_state.get("at_bottom") is True
+                )
+                extent = (
+                    canvas_count,
+                    _mapping_int(scroll_state, "maximum"),
+                    _mapping_int(scroll_state, "chapter_height"),
+                )
+                extent_changed = previous_extent is None or extent != previous_extent
+                previous_extent = extent
+                previous_canvas_count = canvas_count
+                if discovered_canvas or extent_changed:
+                    stable_bottom_passes = 0
+                elif at_bottom:
+                    stable_bottom_passes += 1
+                else:
+                    stable_bottom_passes = 0
+                if stable_bottom_passes >= OCR_CANVAS_STABLE_PASSES:
+                    break
+            else:
+                raise WeReadError(
+                    "微信读书章节持续加载，未能确认正文结尾；请稍后重试。"
+                )
+        except WeReadError:
+            raise
         except Exception as exc:
             raise WeReadError("本地 OCR 无法识别当前章节。") from exc
-        texts = [line.text for line in lines]
         if not texts:
             raise WeReadError("本地 OCR 没有识别到当前章节正文。")
         return texts
+
+    def _positioned_text_rows(
+        self,
+        canvas_coverage_bottom: float | None = None,
+    ) -> list[str]:
+        """Rebuild virtualized WeRead characters in visual row order."""
+
+        try:
+            payload = self.page.evaluate(
+                _EXTRACT_POSITIONED_TEXT,
+                canvas_coverage_bottom,
+            )
+        except Exception:
+            return []
+        if not isinstance(payload, Mapping):
+            return []
+        canvas_bottom = payload.get("canvas_bottom")
+        if isinstance(canvas_bottom, (int, float)) and not isinstance(
+            canvas_bottom,
+            bool,
+        ):
+            self._last_positioned_canvas_bottom = float(canvas_bottom)
+        return _positioned_rows(payload.get("characters"))
 
     def _get_ocr_engine(self) -> Any:
         if self._ocr_engine is not None:
@@ -445,6 +589,86 @@ def _ocr_tiles(source: Image.Image) -> Iterator[tuple[int, Image.Image]]:
         if bottom >= source.height:
             break
         top = bottom - OCR_TILE_OVERLAP_PX
+
+
+def _canvas_png(canvas: Any) -> bytes:
+    """Read Canvas pixels without Playwright scrolling the element into view."""
+
+    try:
+        data_url = canvas.evaluate(_EXTRACT_CANVAS_DATA_URL)
+        if isinstance(data_url, str):
+            header, separator, payload = data_url.partition(",")
+            if (
+                separator
+                and header.lower().startswith("data:image/png;base64")
+                and payload
+            ):
+                png = b64decode(payload, validate=True)
+                if png:
+                    return png
+    except (BinasciiError, ValueError):
+        pass
+    except Exception:
+        # A tainted or temporarily detached Canvas cannot be exported through
+        # the DOM. Keep the old element screenshot as a narrow compatibility
+        # fallback, although normal WeRead text canvases use the no-scroll path.
+        pass
+    return canvas.screenshot(type="png", scale="device")
+
+
+def _extend_with_boundary_overlap(target: list[str], chunk: tuple[str, ...]) -> bool:
+    """Append a newly rendered text chunk without repeating its leading overlap."""
+
+    overlap = 0
+    for size in range(min(len(target), len(chunk)), 0, -1):
+        if tuple(target[-size:]) == chunk[:size]:
+            overlap = size
+            break
+    additions = chunk[overlap:]
+    target.extend(additions)
+    return bool(additions)
+
+
+def _mapping_int(value: Any, key: str) -> int:
+    if not isinstance(value, Mapping):
+        return -1
+    item = value.get(key)
+    if isinstance(item, (int, float)) and not isinstance(item, bool):
+        return int(item)
+    return -1
+
+
+def _ocr_canvas_lines(
+    engine: Any,
+    screenshot: bytes,
+    *,
+    ignore_header: bool,
+) -> list[_OcrLine]:
+    """Recognize one canvas while preserving its local reading order."""
+
+    lines: list[_OcrLine] = []
+    with Image.open(BytesIO(screenshot)) as source:
+        source.load()
+        for tile_top, tile in _ocr_tiles(source):
+            try:
+                result = engine(
+                    _image_png(tile),
+                    unclip_ratio=OCR_DETECTION_UNCLIP_RATIO,
+                )
+                tile_lines = _ocr_lines(result, y_offset=tile_top)
+                for line in tile_lines:
+                    if (
+                        ignore_header
+                        and line.top
+                        < OCR_CANVAS_HEADER_PX * OCR_DEVICE_SCALE_FACTOR
+                    ):
+                        continue
+                    if line.confidence < OCR_LOW_CONFIDENCE:
+                        line = _retry_ocr_line(engine, tile, tile_top, line)
+                    lines.append(line)
+            finally:
+                tile.close()
+    return _merge_ocr_rows(_deduplicate_ocr_lines(lines))
 
 
 def _image_png(image: Image.Image) -> bytes:
@@ -561,6 +785,171 @@ def _deduplicate_ocr_lines(lines: list[_OcrLine]) -> list[_OcrLine]:
     return sorted(unique, key=lambda item: (item.top, item.left))
 
 
+def _merge_ocr_rows(lines: list[_OcrLine]) -> list[_OcrLine]:
+    """Merge horizontally separated OCR boxes that share one visual row."""
+
+    groups: list[list[_OcrLine]] = []
+    for line in sorted(lines, key=lambda item: (item.top, item.left)):
+        matching_group: list[_OcrLine] | None = None
+        for group in reversed(groups):
+            group_top = min(item.top for item in group)
+            group_bottom = max(item.bottom for item in group)
+            overlap = min(group_bottom, line.bottom) - max(group_top, line.top)
+            line_height = max(1.0, line.bottom - line.top)
+            group_height = max(1.0, group_bottom - group_top)
+            center_distance = abs(
+                (line.top + line.bottom) / 2
+                - (group_top + group_bottom) / 2
+            )
+            if (
+                overlap >= min(line_height, group_height) * 0.45
+                or center_distance <= min(line_height, group_height) * 0.35
+            ):
+                matching_group = group
+                break
+            if line.top > group_bottom + max(line_height, group_height):
+                break
+        if matching_group is None:
+            groups.append([line])
+        else:
+            matching_group.append(line)
+
+    merged: list[_OcrLine] = []
+    for group in groups:
+        fragments = sorted(group, key=lambda item: item.left)
+        text = fragments[0].text
+        previous = fragments[0]
+        for fragment in fragments[1:]:
+            text += _ocr_fragment_separator(previous, fragment) + fragment.text
+            previous = fragment
+        merged.append(
+            _OcrLine(
+                top=min(item.top for item in fragments),
+                left=min(item.left for item in fragments),
+                bottom=max(item.bottom for item in fragments),
+                right=max(item.right for item in fragments),
+                text=text,
+                confidence=min(item.confidence for item in fragments),
+            )
+        )
+    return sorted(merged, key=lambda item: (item.top, item.left))
+
+
+def _ocr_fragment_separator(left: _OcrLine, right: _OcrLine) -> str:
+    if not left.text or not right.text:
+        return ""
+    if not (
+        left.text[-1].isascii()
+        and left.text[-1].isalnum()
+        and right.text[0].isascii()
+        and right.text[0].isalnum()
+    ):
+        return ""
+    gap = right.left - left.right
+    average_height = (
+        max(1.0, left.bottom - left.top) + max(1.0, right.bottom - right.top)
+    ) / 2
+    return " " if gap > average_height * 0.12 else ""
+
+
+def _positioned_rows(value: Any) -> list[str]:
+    """Group shuffled positioned characters by y, then sort each row by x."""
+
+    if not isinstance(value, list):
+        return []
+    rows: dict[int, dict[float, str]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        x, y, text = item.get("x"), item.get("y"), item.get("text")
+        if (
+            not isinstance(x, (int, float))
+            or isinstance(x, bool)
+            or not isinstance(y, (int, float))
+            or isinstance(y, bool)
+            or not isinstance(text, str)
+        ):
+            continue
+        cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+        if not cleaned:
+            continue
+        row = rows.setdefault(round(float(y)), {})
+        row.setdefault(round(float(x), 2), cleaned)
+
+    result: list[str] = []
+    for y in sorted(rows):
+        text = "".join(rows[y][x] for x in sorted(rows[y])).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _reconcile_visual_rows(
+    visual_rows: list[str],
+    semantic_paragraphs: Any,
+) -> list[str]:
+    """Keep measured row boundaries while correcting OCR from rendered DOM text."""
+
+    rows = [_clean_render_text(row) for row in visual_rows]
+    rows = [row for row in rows if row]
+    if not rows or not isinstance(semantic_paragraphs, (list, tuple)):
+        return rows
+
+    exact = "".join(
+        _clean_render_text(paragraph)
+        for paragraph in semantic_paragraphs
+        if isinstance(paragraph, str)
+    )
+    recognized = "".join(rows)
+    if not exact or not recognized:
+        return rows
+    length_ratio = len(exact) / len(recognized)
+    if not 0.8 <= length_ratio <= 1.2:
+        return rows
+
+    matcher = SequenceMatcher(None, recognized, exact, autojunk=False)
+    if matcher.ratio() < 0.8:
+        return rows
+
+    boundary_map = [0] * (len(recognized) + 1)
+    for _tag, source_start, source_end, exact_start, exact_end in matcher.get_opcodes():
+        source_span = source_end - source_start
+        exact_span = exact_end - exact_start
+        if source_span == 0:
+            boundary_map[source_start] = exact_end
+            continue
+        for offset in range(source_span + 1):
+            boundary_map[source_start + offset] = exact_start + round(
+                exact_span * offset / source_span
+            )
+
+    boundary_map[0] = 0
+    boundary_map[-1] = len(exact)
+    for index in range(1, len(boundary_map)):
+        boundary_map[index] = max(boundary_map[index - 1], boundary_map[index])
+
+    corrected: list[str] = []
+    source_end = 0
+    exact_start = 0
+    for row_index, row in enumerate(rows):
+        source_end += len(row)
+        exact_end = (
+            len(exact)
+            if row_index == len(rows) - 1
+            else boundary_map[source_end]
+        )
+        text = exact[exact_start:exact_end].strip()
+        if text:
+            corrected.append(text)
+        exact_start = exact_end
+    return corrected or rows
+
+
+def _clean_render_text(value: str) -> str:
+    without_markers = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", value)
+    return " ".join(without_markers.replace("\r", "\n").split()).strip()
+
+
 def _same_detected_line(first: _OcrLine, second: _OcrLine) -> bool:
     vertical_overlap = min(first.bottom, second.bottom) - max(first.top, second.top)
     horizontal_overlap = min(first.right, second.right) - max(first.left, second.left)
@@ -605,6 +994,10 @@ class WeReadSource(ReaderSource):
         self.controller.previous_chapter()
         return self.load_current_chapter()
 
+    def select_chapter(self, chapter_id: str) -> WeReadChapter:
+        self.controller.select_chapter(chapter_id)
+        return self.load_current_chapter()
+
     def restore_window(self) -> None:
         self.controller.restore_window()
 
@@ -631,9 +1024,8 @@ class WeReadSource(ReaderSource):
             raise WeReadError("当前章节正文格式无法识别。")
         units: list[str] = []
         for paragraph in paragraphs:
-            text = _text(paragraph)
-            if text:
-                units.extend(parse_text(text, self.max_chars))
+            if isinstance(paragraph, str):
+                units.extend(parse_text(paragraph, self.max_chars))
         if not units:
             raise WeReadError("当前章节没有可阅读的正文。")
 
@@ -641,6 +1033,22 @@ class WeReadSource(ReaderSource):
         chapter_id = _text(payload.get("chapter_id")) or _stable_id(
             "chapter", f"{chapter_url}\n{chapter_title}"
         )
+        catalog = _chapter_catalog(payload.get("catalog"))
+        catalog_index = payload.get("catalog_index", -1)
+        if (
+            not isinstance(catalog_index, int)
+            or isinstance(catalog_index, bool)
+            or catalog_index < 0
+            or catalog_index >= len(catalog)
+        ):
+            catalog_index = next(
+                (
+                    index
+                    for index, entry in enumerate(catalog)
+                    if entry.chapter_id == chapter_id
+                ),
+                -1,
+            )
         return WeReadChapter(
             book_id=book_id,
             book_title=book_title,
@@ -648,11 +1056,31 @@ class WeReadSource(ReaderSource):
             chapter_title=chapter_title,
             chapter_url=chapter_url,
             units=tuple(units),
+            catalog=catalog,
+            catalog_index=catalog_index,
         )
 
 
 def _text(value: Any) -> str:
     return " ".join(value.replace("\r", "\n").split()).strip() if isinstance(value, str) else ""
+
+
+def _chapter_catalog(value: Any) -> tuple[WeReadCatalogEntry, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    entries: list[WeReadCatalogEntry] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        chapter_id = _text(item.get("chapter_id"))
+        title = _text(item.get("title"))
+        level = item.get("level", 1)
+        if not chapter_id or not title:
+            continue
+        if not isinstance(level, int) or isinstance(level, bool) or level < 1:
+            level = 1
+        entries.append(WeReadCatalogEntry(chapter_id, title, level))
+    return tuple(entries)
 
 
 def _error_summary(error: BaseException) -> str:
@@ -747,6 +1175,171 @@ _EXTRACT_CATALOG_POSITION = r"""
 """
 
 
+_EXTRACT_READINESS_STATE = r"""
+() => {
+  const visible = (node) => {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0;
+  };
+  const loginSelectors = [
+    '.navBar_login', '.loginDialog', '[class*="loginDialog"]',
+    '[class*="LoginDialog"]', '[class*="login_dialog"]'
+  ];
+  if (loginSelectors.some(selector =>
+    Array.from(document.querySelectorAll(selector)).some(visible)
+  )) return 'login';
+
+  const loginLabels = new Set(['登录', '扫码登录', '微信登录', '登录微信读书']);
+  const loginControl = Array.from(
+    document.querySelectorAll('button, a, [role="button"]')
+  ).find(node => visible(node) && loginLabels.has(
+    (node.innerText || node.textContent || '').replace(/\s+/g, '').trim()
+  ));
+  return loginControl ? 'login' : 'book';
+}
+"""
+
+
+_CHAPTER_RENDER_READY = r"""
+() => {
+  const chapter = document.querySelector('.readerChapterContent');
+  if (!chapter) return false;
+  if (chapter.scrollHeight <= 300) return false;
+  const visible = (node) => {
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0;
+  };
+  const paragraphReady = Array.from(chapter.querySelectorAll('p')).some(node =>
+    visible(node) && (node.innerText || node.textContent || '').trim().length >= 2
+  );
+  const positionedCount = Array.from(
+    chapter.querySelectorAll('[data-wr-role="text"]')
+  ).filter(visible).length;
+  const canvasReady = Array.from(chapter.querySelectorAll('canvas')).some(canvas => {
+    const rect = canvas.getBoundingClientRect();
+    return canvas.width > 0 && canvas.height > 0 &&
+      rect.width > 100 && rect.height > 100;
+  });
+  return paragraphReady || positionedCount >= 2 || canvasReady;
+}
+"""
+
+
+_EXTRACT_CANVAS_DATA_URL = r"""
+(canvas) => {
+  if (!(canvas instanceof HTMLCanvasElement) || !canvas.width || !canvas.height) {
+    return '';
+  }
+  try {
+    return canvas.toDataURL('image/png');
+  } catch (error) {
+    return '';
+  }
+}
+"""
+
+
+_EXTRACT_POSITIONED_TEXT = r"""
+(fixedCanvasBottom) => {
+  const chapter = document.querySelector('.readerChapterContent');
+  if (!chapter) return {characters: []};
+  const chapterRect = chapter.getBoundingClientRect();
+  const measuredCanvasBottom = Array.from(chapter.querySelectorAll('canvas')).reduce(
+    (bottom, canvas) => Math.max(
+      bottom,
+      canvas.getBoundingClientRect().bottom - chapterRect.top
+    ),
+    Number.NEGATIVE_INFINITY
+  );
+  const canvasBottom = Number.isFinite(fixedCanvasBottom)
+    ? fixedCanvasBottom
+    : measuredCanvasBottom;
+  const characters = [];
+  for (const node of chapter.querySelectorAll('[data-wr-role="text"]')) {
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+        rect.width <= 0 || rect.height <= 0) continue;
+    const text = node.textContent || '';
+    if (!text) continue;
+    const y = rect.top - chapterRect.top;
+    if (Number.isFinite(canvasBottom) && y < canvasBottom - 2) continue;
+    characters.push({
+      x: rect.left - chapterRect.left,
+      y,
+      text
+    });
+  }
+  return {
+    characters,
+    canvas_bottom: Number.isFinite(canvasBottom) ? canvasBottom : null,
+    measured_canvas_bottom: Number.isFinite(measuredCanvasBottom)
+      ? measuredCanvasBottom
+      : null
+  };
+}
+"""
+
+
+_MOVE_CANVAS_DISCOVERY = r"""
+(action) => {
+  const chapter = document.querySelector('.readerChapterContent');
+  if (!chapter) return {at_bottom: false, moved: false};
+
+  const isScrollable = (node) => {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    return /(auto|scroll|overlay)/.test(style.overflowY) &&
+      node.scrollHeight > node.clientHeight + 2;
+  };
+
+  let scroller = chapter;
+  while (scroller && scroller !== document.documentElement &&
+         !isScrollable(scroller)) {
+    scroller = scroller.parentElement;
+  }
+  if (!isScrollable(scroller)) {
+    scroller = document.scrollingElement || document.documentElement;
+  }
+
+  const documentScroller = scroller === document.body ||
+    scroller === document.documentElement ||
+    scroller === document.scrollingElement;
+  const viewportHeight = documentScroller ? window.innerHeight : scroller.clientHeight;
+  const before = documentScroller ? window.scrollY : scroller.scrollTop;
+  const maximum = Math.max(0, scroller.scrollHeight - viewportHeight);
+  const target = action === 'top' ? 0 : Math.min(
+      maximum,
+      before + Math.max(200, Math.floor(viewportHeight * 0.8))
+    );
+  if (documentScroller) {
+    window.scrollTo(0, target);
+  } else {
+    scroller.scrollTop = target;
+  }
+  const after = documentScroller ? window.scrollY : scroller.scrollTop;
+  if (action !== 'top' && after >= maximum - 2 && after <= before + 1) {
+    scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
+    if (!documentScroller) {
+      window.dispatchEvent(new Event('scroll'));
+    }
+  }
+  return {
+    at_bottom: after >= maximum - 2,
+    moved: after > before + 1,
+    position: after,
+    maximum,
+    chapter_height: chapter.scrollHeight
+  };
+}
+"""
+
+
 _EXTRACT_CURRENT_CHAPTER = r"""
 () => {
   const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
@@ -810,6 +1403,8 @@ _EXTRACT_CURRENT_CHAPTER = r"""
       '[class*="chapterTitle"]', '[class*="chapter_title"]'
     ], chapter) || firstText(['[class*="readerTopBar_chapter"]']),
     chapter_url: window.location.href,
+    has_canvas: !!chapter.querySelector('canvas'),
+    uses_visual_renderer: !!chapter.querySelector('[data-wr-role="text"]'),
     paragraphs
   };
 }

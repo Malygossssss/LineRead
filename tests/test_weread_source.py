@@ -1,5 +1,6 @@
 import os
 import unittest
+from base64 import b64encode
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,6 +8,11 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from weread_source import (
+    _OcrLine,
+    _merge_ocr_rows,
+    _positioned_rows,
+    _reconcile_visual_rows,
+    WeReadCatalogEntry,
     WeReadController,
     WeReadError,
     WeReadSource,
@@ -21,6 +27,11 @@ def png_bytes(width=800, height=400):
     return output.getvalue()
 
 
+def png_data_url(width=800, height=400):
+    payload = b64encode(png_bytes(width=width, height=height)).decode("ascii")
+    return f"data:image/png;base64,{payload}"
+
+
 class FakeController:
     def __init__(self):
         self.payload = {
@@ -30,6 +41,19 @@ class FakeController:
             "chapter_title": "第一章",
             "chapter_url": "https://weread.qq.com/web/reader/book-1-chapter-1",
             "paragraphs": ["第一句。第二句！", "这是较短的一段。"],
+            "catalog_index": 0,
+            "catalog": [
+                {
+                    "chapter_id": "chapter-1",
+                    "title": "第一章",
+                    "level": 1,
+                },
+                {
+                    "chapter_id": "chapter-2",
+                    "title": "第二章",
+                    "level": 1,
+                },
+            ],
         }
         self.calls = []
 
@@ -49,6 +73,16 @@ class FakeController:
     def previous_chapter(self):
         self.calls.append("previous")
 
+    def select_chapter(self, chapter_id):
+        self.calls.append(("select", chapter_id))
+        self.payload = {
+            **self.payload,
+            "chapter_id": chapter_id,
+            "chapter_title": "第二章",
+            "catalog_index": 1,
+            "paragraphs": ["直接选中的正文。"],
+        }
+
     def restore_window(self):
         self.calls.append("restore")
 
@@ -67,7 +101,15 @@ class WeReadSourceTests(unittest.TestCase):
         self.assertEqual(chapter.chapter_title, "第一章")
         self.assertEqual(
             chapter.units,
-            ("第一句。", "第二句！", "这是较短的一段。"),
+            ("第一句。第二句！", "这是较短的一段。"),
+        )
+        self.assertEqual(chapter.catalog_index, 0)
+        self.assertEqual(
+            chapter.catalog,
+            (
+                WeReadCatalogEntry("chapter-1", "第一章", 1),
+                WeReadCatalogEntry("chapter-2", "第二章", 1),
+            ),
         )
         self.assertIs(source.cached_chapter, chapter)
 
@@ -80,6 +122,16 @@ class WeReadSourceTests(unittest.TestCase):
         self.assertEqual(controller.calls, ["next", "current"])
         self.assertEqual(chapter.chapter_id, "chapter-2")
         self.assertEqual(chapter.units, ("新章正文。",))
+
+    def test_select_chapter_delegates_stable_id_then_refreshes_cache(self):
+        controller = FakeController()
+        source = WeReadSource(controller)
+
+        chapter = source.select_chapter("chapter-2")
+
+        self.assertEqual(controller.calls, [("select", "chapter-2"), "current"])
+        self.assertEqual(chapter.chapter_id, "chapter-2")
+        self.assertEqual(chapter.units, ("直接选中的正文。",))
 
     def test_missing_book_title_or_body_is_rejected(self):
         controller = FakeController()
@@ -242,6 +294,45 @@ class WeReadControllerChapterTests(unittest.TestCase):
         controller._context = Mock()
         return controller, page
 
+    def test_readiness_state_reports_reader_from_url_without_dom_probe(self):
+        controller, page = self.make_connected_controller()
+
+        state = controller.readiness_state()
+
+        self.assertEqual(state, "reader")
+        page.evaluate.assert_not_called()
+
+    def test_readiness_state_distinguishes_login_from_book_selection(self):
+        controller, page = self.make_connected_controller()
+        page.url = "https://weread.qq.com/"
+        page.evaluate.side_effect = ["login", "book"]
+
+        self.assertEqual(controller.readiness_state(), "login")
+        self.assertEqual(controller.readiness_state(), "book")
+
+    def test_selecting_already_current_hidden_catalog_item_is_a_noop(self):
+        controller, page = self.make_connected_controller()
+        items = Mock()
+        target = Mock()
+        items.count.return_value = 3
+        items.nth.return_value = target
+        target.evaluate.return_value = True
+        page.locator.return_value = items
+
+        controller._select_catalog_index(1)
+
+        target.is_visible.assert_not_called()
+        target.click.assert_not_called()
+        page.wait_for_function.assert_not_called()
+
+    def test_chapter_render_wait_uses_a_bounded_page_condition(self):
+        controller, page = self.make_connected_controller()
+
+        controller._wait_for_chapter_render()
+
+        page.wait_for_function.assert_called_once()
+        self.assertEqual(page.wait_for_function.call_args.kwargs["timeout"], 20_000)
+
     def test_current_canvas_chapter_uses_catalog_metadata_and_ocr_lines(self):
         controller, page = self.make_connected_controller()
         page.evaluate.return_value = {
@@ -263,6 +354,13 @@ class WeReadControllerChapterTests(unittest.TestCase):
                     "count": 10,
                     "chapter_id": "catalog:stable-seven",
                     "title": "第七章",
+                    "entries": [
+                        {
+                            "chapter_id": "catalog:stable-seven",
+                            "title": "第七章",
+                            "level": 1,
+                        }
+                    ],
                 },
             ),
             patch.object(
@@ -279,6 +377,116 @@ class WeReadControllerChapterTests(unittest.TestCase):
         self.assertEqual(payload["chapter_title"], "第七章")
         self.assertEqual(payload["paragraphs"], ["正文第一行。", "正文第二行。"])
 
+    def test_canvas_chapter_uses_visual_rows_even_when_dom_paragraphs_exist(self):
+        controller, page = self.make_connected_controller()
+        page.evaluate.return_value = {
+            "book_id": "book-1",
+            "book_title": "测试书",
+            "chapter_id": "",
+            "chapter_title": "第六章",
+            "chapter_url": page.url,
+            "has_canvas": True,
+            "paragraphs": ["一个跨越页面多行的 DOM 段落。第二句。第三句。"],
+        }
+
+        with (
+            patch.object(controller, "_ensure_vertical_layout"),
+            patch.object(
+                controller,
+                "_catalog_position",
+                return_value={
+                    "index": 6,
+                    "count": 10,
+                    "chapter_id": "catalog:stable-six",
+                    "title": "第六章",
+                    "entries": [],
+                },
+            ),
+            patch.object(
+                controller,
+                "_ocr_current_canvas",
+                return_value=["页面第一行。", "页面第二行。"],
+            ) as ocr,
+        ):
+            payload = controller.get_current_chapter()
+
+        ocr.assert_called_once_with()
+        self.assertEqual(payload["paragraphs"], ["页面第一行。", "页面第二行。"])
+
+    def test_positioned_text_renderer_overrides_semantic_dom_paragraphs(self):
+        controller, page = self.make_connected_controller()
+        page.evaluate.return_value = {
+            "book_id": "book-1",
+            "book_title": "测试书",
+            "chapter_id": "",
+            "chapter_title": "第六章",
+            "chapter_url": page.url,
+            "has_canvas": False,
+            "uses_visual_renderer": True,
+            "paragraphs": ["这是一个跨越多行的完整段落。"],
+        }
+
+        with (
+            patch.object(controller, "_ensure_vertical_layout"),
+            patch.object(
+                controller,
+                "_catalog_position",
+                return_value={
+                    "index": 6,
+                    "count": 10,
+                    "chapter_id": "catalog:stable-six",
+                    "title": "第六章",
+                    "entries": [],
+                },
+            ),
+            patch.object(
+                controller,
+                "_ocr_current_canvas",
+                return_value=["页面第一行。", "页面第二行。"],
+            ) as visual_rows,
+        ):
+            payload = controller.get_current_chapter()
+
+        visual_rows.assert_called_once_with()
+        self.assertEqual(payload["paragraphs"], ["页面第一行。", "页面第二行。"])
+
+    def test_positioned_only_chapter_does_not_require_ocr_engine(self):
+        controller, page = self.make_connected_controller()
+        canvas_locator = Mock()
+        canvas_locator.count.return_value = 0
+        page.locator.return_value = canvas_locator
+        page.evaluate.return_value = {
+            "at_bottom": True,
+            "position": 800,
+            "maximum": 800,
+            "chapter_height": 1600,
+        }
+        snapshots = [
+            ["第一行。", "第二行。"],
+            ["第二行。", "最后一行。"],
+            ["第二行。", "最后一行。"],
+        ]
+        snapshot_calls = 0
+
+        def positioned_rows(_canvas_bottom=None):
+            nonlocal snapshot_calls
+            value = snapshots[min(snapshot_calls, len(snapshots) - 1)]
+            snapshot_calls += 1
+            return value
+
+        with (
+            patch.object(
+                controller,
+                "_positioned_text_rows",
+                side_effect=positioned_rows,
+            ),
+            patch.object(controller, "_get_ocr_engine") as get_ocr_engine,
+        ):
+            lines = controller._ocr_current_canvas()
+
+        get_ocr_engine.assert_not_called()
+        self.assertEqual(lines, ["第一行。", "第二行。", "最后一行。"])
+
     def test_ocr_ignores_canvas_header_navigation(self):
         controller, page = self.make_connected_controller()
         canvas = Mock()
@@ -287,6 +495,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         locator.count.return_value = 1
         locator.first = canvas
         page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
         controller._ocr_engine = Mock(
             return_value=(
                 [
@@ -301,8 +510,334 @@ class WeReadControllerChapterTests(unittest.TestCase):
         lines = controller._ocr_current_canvas()
 
         self.assertEqual(lines, ["正文第一行。", "正文第二行。"])
-        canvas.screenshot.assert_called_once_with(type="png", scale="device")
+        canvas.screenshot.assert_any_call(type="png", scale="device")
         self.assertEqual(controller._ocr_engine.call_args.kwargs["unclip_ratio"], 1.8)
+        self.assertEqual(
+            [call.args[1] for call in page.evaluate.call_args_list[:2]],
+            ["top", "top"],
+        )
+
+    def test_ocr_merges_horizontal_fragments_into_one_visual_row(self):
+        lines = [
+            _OcrLine(100, 10, 140, 220, "同一行的前半，", 0.96),
+            _OcrLine(102, 225, 141, 430, "同一行的后半。", 0.98),
+            _OcrLine(180, 10, 220, 430, "下一行。", 0.97),
+        ]
+
+        merged = _merge_ocr_rows(lines)
+
+        self.assertEqual(
+            [line.text for line in merged],
+            ["同一行的前半，同一行的后半。", "下一行。"],
+        )
+
+    def test_positioned_characters_are_rebuilt_by_visual_coordinates(self):
+        characters = [
+            {"x": 42, "y": 100, "text": "行"},
+            {"x": 0, "y": 141, "text": "第"},
+            {"x": 21, "y": 100, "text": "一"},
+            {"x": 0, "y": 100, "text": "第"},
+            {"x": 21, "y": 141, "text": "二"},
+            {"x": 63, "y": 100, "text": "。\u200b"},
+            {"x": 42, "y": 141, "text": "行。"},
+        ]
+
+        self.assertEqual(_positioned_rows(characters), ["第一行。", "第二行。"])
+
+    def test_visual_boundaries_are_kept_while_dom_text_corrects_ocr(self):
+        rows = ["第一行有错宇。", "第二行。", "尾声99"]
+        paragraphs = ["第一行有错字。第二行。", "尾声。"]
+
+        corrected = _reconcile_visual_rows(rows, paragraphs)
+
+        self.assertEqual(corrected, ["第一行有错字。", "第二行。", "尾声。"])
+
+    def test_partial_dom_text_does_not_replace_a_complete_visual_capture(self):
+        rows = ["完整第一行。", "完整第二行。", "完整第三行。"]
+
+        corrected = _reconcile_visual_rows(rows, ["只有一小段。"])
+
+        self.assertEqual(corrected, rows)
+
+    def test_ocr_appends_virtualized_positioned_rows_across_scroll_passes(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.screenshot.return_value = png_bytes()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
+        controller._ocr_engine = Mock(
+            return_value=(
+                [
+                    (
+                        [[16, 170], [700, 170], [700, 216], [16, 216]],
+                        "画布首行。",
+                        0.98,
+                    )
+                ],
+                None,
+            )
+        )
+        snapshots = [
+            [],
+            ["中部第一行。", "中部第二行。"],
+            ["中部第二行。", "尾部。"],
+        ]
+        snapshot_calls = 0
+
+        def positioned_rows(_canvas_bottom=None):
+            nonlocal snapshot_calls
+            value = snapshots[min(snapshot_calls, len(snapshots) - 1)]
+            snapshot_calls += 1
+            return value
+
+        with patch.object(
+            controller,
+            "_positioned_text_rows",
+            side_effect=positioned_rows,
+        ):
+            lines = controller._ocr_current_canvas()
+
+        self.assertEqual(
+            lines,
+            ["画布首行。", "中部第一行。", "中部第二行。", "尾部。"],
+        )
+
+    def test_ocr_reads_all_chapter_canvases_in_order(self):
+        controller, page = self.make_connected_controller()
+        first_canvas = Mock()
+        first_canvas.screenshot.return_value = png_bytes()
+        second_canvas = Mock()
+        second_canvas.screenshot.return_value = png_bytes(height=401)
+        locator = Mock()
+        locator.count.return_value = 2
+        locator.first = first_canvas
+        locator.nth.return_value = second_canvas
+        page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [
+                        ([[0, 48], [180, 48], [180, 94], [0, 94]], "测试书", 0.99),
+                        ([[16, 170], [700, 170], [700, 216], [16, 216]], "第一块正文。", 0.98),
+                    ],
+                    None,
+                ),
+                (
+                    [
+                        ([[16, 48], [700, 48], [700, 94], [16, 94]], "第二块顶部正文。", 0.97),
+                    ],
+                    None,
+                ),
+            ]
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["第一块正文。", "第二块顶部正文。"])
+        first_canvas.screenshot.assert_any_call(type="png", scale="device")
+        second_canvas.screenshot.assert_any_call(type="png", scale="device")
+        locator.nth.assert_any_call(1)
+
+    def test_ocr_reads_canvas_pixels_without_element_screenshot_scrolling(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.evaluate.return_value = png_data_url()
+        canvas.screenshot.return_value = png_bytes()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
+        controller._ocr_engine = Mock(
+            return_value=(
+                [
+                    (
+                        [[16, 170], [700, 170], [700, 216], [16, 216]],
+                        "正文不应触发页面跳动。",
+                        0.98,
+                    )
+                ],
+                None,
+            )
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["正文不应触发页面跳动。"])
+        canvas.evaluate.assert_called()
+        canvas.screenshot.assert_not_called()
+
+    def test_ocr_pixel_changes_with_same_text_do_not_block_stable_completion(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        screenshots = [png_data_url(height=400 + index) for index in range(4)]
+        screenshot_calls = 0
+
+        def changing_pixels(_script):
+            nonlocal screenshot_calls
+            value = screenshots[min(screenshot_calls, len(screenshots) - 1)]
+            screenshot_calls += 1
+            return value
+
+        canvas.evaluate.side_effect = changing_pixels
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
+        controller._ocr_engine = Mock(
+            return_value=(
+                [
+                    (
+                        [[16, 170], [700, 170], [700, 216], [16, 216]],
+                        "相同正文。",
+                        0.98,
+                    )
+                ],
+                None,
+            )
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["相同正文。"])
+        self.assertEqual(controller._ocr_engine.call_count, 4)
+
+    def test_ocr_discovers_canvases_appended_while_scrolling(self):
+        controller, page = self.make_connected_controller()
+        canvases = [Mock(), Mock(), Mock()]
+        for index, canvas in enumerate(canvases):
+            canvas.screenshot.return_value = png_bytes(height=400 + index)
+
+        locator = Mock()
+        locator.count.side_effect = [1, 2, 3] + [3] * 9
+        locator.first = canvases[0]
+        locator.nth.side_effect = lambda index: canvases[index]
+        page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [
+                        (
+                            [[16, 170], [700, 170], [700, 216], [16, 216]],
+                            f"第{index + 1}块正文。",
+                            0.98,
+                        )
+                    ],
+                    None,
+                )
+                for index in range(3)
+            ]
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["第1块正文。", "第2块正文。", "第3块正文。"])
+        self.assertEqual(controller._ocr_engine.call_count, 3)
+        self.assertGreaterEqual(page.evaluate.call_count, 3)
+
+    def test_ocr_discovers_a_canvas_redrawn_while_scrolling(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        screenshots = [png_bytes(height=400 + index) for index in range(3)]
+        screenshot_calls = 0
+
+        def redrawn_canvas(**_kwargs):
+            nonlocal screenshot_calls
+            value = screenshots[min(screenshot_calls, len(screenshots) - 1)]
+            screenshot_calls += 1
+            return value
+
+        canvas.screenshot.side_effect = redrawn_canvas
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        page.evaluate.side_effect = [
+            {},
+            {"at_bottom": False},
+            {"at_bottom": False},
+        ] + [{"at_bottom": True}] * 10
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [
+                        (
+                            [[16, 170], [700, 170], [700, 216], [16, 216]],
+                            f"第{index + 1}屏正文。",
+                            0.98,
+                        )
+                    ],
+                    None,
+                )
+                for index in range(3)
+            ]
+        )
+
+        with patch.object(controller, "_positioned_text_rows", return_value=[]):
+            lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["第1屏正文。", "第2屏正文。", "第3屏正文。"])
+        self.assertEqual(controller._ocr_engine.call_count, 3)
+
+    def test_ocr_waits_through_temporary_bottom_for_delayed_canvas_growth(self):
+        controller, page = self.make_connected_controller()
+        first_canvas = Mock()
+        first_canvas.evaluate.return_value = png_data_url(height=400)
+        second_canvas = Mock()
+        second_canvas.evaluate.return_value = png_data_url(height=401)
+        locator = Mock()
+        count_calls = 0
+
+        def canvas_count():
+            nonlocal count_calls
+            count_calls += 1
+            return 1 if count_calls <= 4 else 2
+
+        locator.count.side_effect = canvas_count
+        locator.first = first_canvas
+        locator.nth.return_value = second_canvas
+        page.locator.return_value = locator
+        page.evaluate.return_value = {
+            "at_bottom": True,
+            "position": 800,
+            "maximum": 800,
+            "chapter_height": 1600,
+        }
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [
+                        (
+                            [[16, 170], [700, 170], [700, 216], [16, 216]],
+                            "前半章正文。",
+                            0.98,
+                        )
+                    ],
+                    None,
+                ),
+                (
+                    [
+                        (
+                            [[16, 170], [700, 170], [700, 216], [16, 216]],
+                            "后半章正文。",
+                            0.98,
+                        )
+                    ],
+                    None,
+                ),
+            ]
+        )
+
+        lines = controller._ocr_current_canvas()
+
+        self.assertEqual(lines, ["前半章正文。", "后半章正文。"])
+        self.assertGreater(count_calls, 4)
 
     def test_ocr_splits_tall_canvas_and_deduplicates_overlapping_lines(self):
         controller, page = self.make_connected_controller()
@@ -312,6 +847,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         locator.count.return_value = 1
         locator.first = canvas
         page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
         tile_heights = []
 
         def recognize(tile_png, **kwargs):
@@ -349,6 +885,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         locator.count.return_value = 1
         locator.first = canvas
         page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
         controller._ocr_engine = Mock(
             side_effect=[
                 (
@@ -375,6 +912,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         locator.count.return_value = 1
         locator.first = canvas
         page.locator.return_value = locator
+        page.evaluate.return_value = {"at_bottom": True}
         controller._ocr_engine = Mock(
             side_effect=[
                 (
