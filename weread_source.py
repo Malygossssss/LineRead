@@ -183,9 +183,14 @@ class WeReadController:
             self._wait_for_chapter_render()
             catalog_position = self._catalog_position()
             payload = self.page.evaluate(_EXTRACT_CURRENT_CHAPTER)
+        except WeReadError:
+            # Keep actionable failures (for example, a missing layout control)
+            # intact instead of hiding them behind a generic extraction error.
+            raise
         except Exception as exc:
             raise WeReadError(
-                "未能读取当前章节正文；微信读书页面结构可能已变化，请刷新后重试。"
+                "未能读取当前章节正文；微信读书页面结构可能已变化，请刷新后重试。\n"
+                f"底层错误：{_error_summary(exc)}"
             ) from exc
         if not isinstance(payload, Mapping):
             raise WeReadError("微信读书返回了无法识别的章节数据。")
@@ -349,12 +354,11 @@ class WeReadController:
         if horizontal.count() and horizontal.first.is_visible():
             return
 
-        # The layout button has no accessible label in the current reader. Its
-        # stable position is immediately after the book-review control and
-        # before the font-size control in both layouts.
-        toggle = self.page.locator(
-            ".readerControls_item.showBookReviews + .readerControls_item"
-        )
+        # WeRead names the switch by the *current* layout: vertical mode uses
+        # ``isNormalReader`` while horizontal mode uses ``isHorizontalReader``.
+        # The book-review control is absent in vertical mode, so locating the
+        # switch relative to it fails precisely when a switch is needed.
+        toggle = self.page.locator(".readerControls_item.isNormalReader")
         if toggle.count() == 0 or not toggle.first.is_visible():
             raise WeReadError("无法切换微信读书为翻页模式。")
         toggle.first.click()

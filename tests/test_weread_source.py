@@ -519,7 +519,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         def locator(selector):
             if selector == ".wr_horizontalReader":
                 return horizontal
-            if selector == ".readerControls_item.showBookReviews + .readerControls_item":
+            if selector == ".readerControls_item.isNormalReader":
                 return toggle
             return Mock()
 
@@ -530,6 +530,22 @@ class WeReadControllerChapterTests(unittest.TestCase):
         toggle.click.assert_called_once_with()
         page.wait_for_function.assert_called_once()
         self.assertEqual(page.wait_for_function.call_args.kwargs["timeout"], 10_000)
+
+    def test_current_chapter_preserves_actionable_layout_error(self):
+        controller, page = self.make_connected_controller()
+
+        with (
+            patch.object(controller, "_wait_for_chapter_render"),
+            patch.object(
+                controller,
+                "_ensure_horizontal_layout",
+                side_effect=WeReadError("无法切换微信读书为翻页模式。"),
+            ),
+        ):
+            with self.assertRaisesRegex(WeReadError, "无法切换微信读书为翻页模式"):
+                controller.get_current_chapter()
+
+        page.evaluate.assert_not_called()
 
     def test_page_turn_clicks_public_control_and_waits_for_new_render(self):
         controller, page = self.make_connected_controller()
