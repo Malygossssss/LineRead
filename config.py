@@ -29,10 +29,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "font_size": 14,
     "opacity": 0.85,
     "shortcuts": DEFAULT_SHORTCUTS.copy(),
-    "weread": {
-        "active_book_id": "",
-        "books": {},
-    },
 }
 
 
@@ -75,6 +71,9 @@ def normalize_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         normalized["file"] = file_value
 
     normalized["index"] = max(0, _integer(raw.get("index"), DEFAULT_CONFIG["index"]))
+    # WeRead owns reading progress; legacy LineRead indexes are intentionally ignored.
+    if normalized["source"] == "weread":
+        normalized["index"] = 0
     normalized["x"] = _integer(raw.get("x"), DEFAULT_CONFIG["x"])
     normalized["y"] = _integer(raw.get("y"), DEFAULT_CONFIG["y"])
 
@@ -108,44 +107,9 @@ def normalize_config(raw: Mapping[str, Any]) -> dict[str, Any]:
             "opacity_wheel": opacity_wheel,
         }
 
-    weread_value = raw.get("weread")
-    if isinstance(weread_value, Mapping):
-        books_value = weread_value.get("books")
-        books: dict[str, dict[str, Any]] = {}
-        if isinstance(books_value, Mapping):
-            for key, value in books_value.items():
-                position = _weread_position(key, value)
-                if position is not None:
-                    books[position["book_id"]] = position
-
-        active_book_id = _string(weread_value.get("active_book_id"))
-        if active_book_id not in books:
-            active_book_id = ""
-        normalized["weread"] = {
-            "active_book_id": active_book_id,
-            "books": books,
-        }
+    # Do not copy the legacy ``weread`` mapping. The persistent browser is the
+    # sole source of truth for the current book and chapter.
     return normalized
-
-
-def _weread_position(key: Any, value: Any) -> dict[str, Any] | None:
-    if not isinstance(key, str) or not isinstance(value, Mapping):
-        return None
-
-    book_id = _string(value.get("book_id")) or key.strip()
-    chapter_id = _string(value.get("chapter_id"))
-    if not book_id or not chapter_id:
-        return None
-
-    line_index = _integer(value.get("line_index"), 0)
-    return {
-        "book_id": book_id,
-        "book_title": _string(value.get("book_title")),
-        "chapter_id": chapter_id,
-        "chapter_title": _string(value.get("chapter_title")),
-        "chapter_url": _string(value.get("chapter_url")),
-        "line_index": max(0, line_index),
-    }
 
 
 def _integer(value: Any, fallback: int) -> int:
@@ -162,7 +126,3 @@ def _number(value: Any, fallback: float) -> float:
 
 def _modifier(value: Any, fallback: str) -> str:
     return value if value in ALLOWED_WHEEL_MODIFIERS else fallback
-
-
-def _string(value: Any) -> str:
-    return value.strip() if isinstance(value, str) else ""

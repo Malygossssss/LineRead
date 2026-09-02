@@ -10,9 +10,5 @@
   "shortcuts": {
     "font_wheel": "Ctrl",
     "opacity_wheel": "Shift"
-  },
-  "weread": {
-    "active_book_id": "",
-    "books": {}
   }
 }

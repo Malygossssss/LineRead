@@ -111,7 +111,7 @@ class DesktopReaderTests(unittest.TestCase):
 
         self.assertEqual(reader.label.text(), "连接失败：正文读取失败")
 
-    def test_ready_chapter_replaces_status_and_restores_saved_line(self):
+    def test_ready_chapter_ignores_legacy_saved_line_and_starts_at_first(self):
         chapter = self._chapter("book-1", "chapter-6", ["甲。", "乙。", "丙。"])
         state = self.make_state(
             source="weread",
@@ -137,16 +137,10 @@ class DesktopReaderTests(unittest.TestCase):
         self.addCleanup(reader.close)
         reader.set_loading_status("文本渲染中…")
 
-        loading_state = reader.get_state()
-        self.assertEqual(
-            loading_state["weread"]["books"]["book-1"]["line_index"],
-            1,
-        )
-
         reader.load_weread_chapter(chapter)
 
-        self.assertEqual(reader.index, 1)
-        self.assertEqual(reader.label.text(), "乙。")
+        self.assertEqual(reader.index, 0)
+        self.assertEqual(reader.label.text(), "甲。")
 
     def test_font_size_is_clamped_and_updates_label(self):
         reader = self.make_reader(font_size=14)
@@ -302,7 +296,7 @@ class DesktopReaderTests(unittest.TestCase):
             ["第一条。", "第二条。"],
             self.make_state(),
             source_type="txt",
-            open_weread_callback=lambda parent, saved: self._chapter(
+            open_weread_callback=lambda parent: self._chapter(
                 "book-1", "chapter-1", ["正文。"]
             ),
         )
@@ -314,7 +308,7 @@ class DesktopReaderTests(unittest.TestCase):
 
         self.assertEqual(labels, ["打开文件", "阅读详情", "设置", "退出"])
 
-    def test_exported_weread_state_contains_book_chapter_and_line_index(self):
+    def test_exported_state_does_not_contain_weread_progress(self):
         chapter = self._chapter("book-1", "chapter-6", ["甲。", "乙。", "丙。"])
         reader = DesktopReader(
             chapter.units,
@@ -328,17 +322,8 @@ class DesktopReaderTests(unittest.TestCase):
         state = reader.get_state()
 
         self.assertEqual(state["source"], "weread")
-        self.assertEqual(
-            state["weread"]["books"]["book-1"],
-            {
-                "book_id": "book-1",
-                "book_title": "测试书",
-                "chapter_id": "chapter-6",
-                "chapter_title": "第六章",
-                "chapter_url": "https://weread.qq.com/web/reader/book-1-chapter-6",
-                "line_index": 2,
-            },
-        )
+        self.assertEqual(state["index"], 0)
+        self.assertNotIn("weread", state)
 
     def test_weread_menu_contains_book_and_chapter_runtime_actions(self):
         chapter = self._chapter("book-1", "chapter-1", ["第一行。", "第二行。"])
@@ -347,8 +332,8 @@ class DesktopReaderTests(unittest.TestCase):
             self.make_state(source="weread"),
             source_type="weread",
             weread_chapter=chapter,
-            open_weread_callback=lambda parent, saved: chapter,
-            switch_book_callback=lambda parent, current: chapter,
+            open_weread_callback=lambda parent: chapter,
+            switch_book_callback=lambda parent: chapter,
             chapter_change_callback=lambda parent, direction: True,
             chapter_select_callback=lambda parent, chapter_id: True,
         )
@@ -386,14 +371,12 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertEqual(
             reader.reading_detail_lines(),
             [
-                "当前来源：微信读书",
-                "当前书籍：《测试书》",
                 "当前章节：第六章",
-                "当前章节进度：2 / 3 行",
+                "当前页面进度：2 / 3 行",
             ],
         )
 
-    def test_end_of_weread_chapter_automatically_loads_next_chapter(self):
+    def test_end_of_weread_page_lazily_loads_next_page(self):
         first = self._chapter("book-1", "chapter-1", ["末行。"])
         calls = []
         reader = DesktopReader(
@@ -401,7 +384,7 @@ class DesktopReaderTests(unittest.TestCase):
             self.make_state(source="weread"),
             source_type="weread",
             weread_chapter=first,
-            chapter_change_callback=lambda parent, direction: calls.append(direction) or True,
+            page_change_callback=lambda parent, direction: calls.append(direction) or True,
         )
         self.addCleanup(reader.close)
 
@@ -411,6 +394,66 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertTrue(reader._loading)
         self.assertEqual(reader.index, 0)
         self.assertEqual(reader.label.text(), "文本渲染中…")
+
+    def test_start_of_weread_page_lazily_loads_previous_page(self):
+        current = self._chapter("book-1", "chapter-1", ["首行。", "末行。"])
+        calls = []
+        reader = DesktopReader(
+            current.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=current,
+            page_change_callback=lambda parent, direction: calls.append(direction) or True,
+        )
+        self.addCleanup(reader.close)
+
+        reader.navigate(-1)
+
+        self.assertEqual(calls, [-1])
+        self.assertTrue(reader._loading)
+
+    def test_finished_page_turn_uses_first_or_last_line_by_direction(self):
+        current = self._chapter("book-1", "chapter-1", ["当前页。"])
+        target = self._chapter("book-1", "chapter-1", ["甲。", "乙。", "丙。"])
+        reader = DesktopReader(
+            current.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=current,
+            page_change_callback=lambda parent, direction: True,
+        )
+        self.addCleanup(reader.close)
+
+        reader.navigate(1)
+        reader.finish_page_change(target, 1)
+        self.assertEqual(reader.index, 0)
+        self.assertEqual(reader.label.text(), "甲。")
+
+        reader.navigate(-1)
+        reader.finish_page_change(target, -1)
+        self.assertEqual(reader.index, 2)
+        self.assertEqual(reader.label.text(), "丙。")
+
+    def test_failed_page_turn_restores_previous_page_line(self):
+        current = self._chapter("book-1", "chapter-1", ["第一行。", "第二行。"])
+        reader = DesktopReader(
+            current.units,
+            self.make_state(source="weread"),
+            source_type="weread",
+            weread_chapter=current,
+            page_change_callback=lambda parent, direction: True,
+        )
+        self.addCleanup(reader.close)
+        reader.index = 1
+        reader.navigate(1)
+
+        with patch("reader_window.QMessageBox.warning") as warning:
+            reader.fail_page_change("页面读取失败")
+
+        self.assertFalse(reader._loading)
+        self.assertEqual(reader.index, 1)
+        self.assertEqual(reader.label.text(), "第二行。")
+        warning.assert_called_once()
 
     def test_finished_chapter_change_replaces_loading_status(self):
         first = self._chapter("book-1", "chapter-1", ["末行。"])
@@ -473,7 +516,7 @@ class DesktopReaderTests(unittest.TestCase):
         self.assertEqual(selected, ["chapter-2"])
         self.assertEqual(reader.label.text(), "文本渲染中…")
 
-    def test_switching_books_restores_saved_chapter_line(self):
+    def test_switching_books_starts_at_the_first_line(self):
         first = self._chapter("book-1", "chapter-1", ["一。", "二。"])
         second = self._chapter("book-2", "chapter-8", ["甲。", "乙。", "丙。"])
         state = self.make_state(
@@ -497,15 +540,15 @@ class DesktopReaderTests(unittest.TestCase):
             state,
             source_type="weread",
             weread_chapter=first,
-            switch_book_callback=lambda parent, current: second,
+            switch_book_callback=lambda parent: second,
         )
         self.addCleanup(reader.close)
 
         reader.switch_weread_book()
 
         self.assertEqual(reader.book_id, "book-2")
-        self.assertEqual(reader.index, 2)
-        self.assertEqual(reader.label.text(), "丙。")
+        self.assertEqual(reader.index, 0)
+        self.assertEqual(reader.label.text(), "甲。")
 
     def test_open_text_file_replaces_units_resets_index_and_saves(self):
         saved_states = []

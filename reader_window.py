@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
 from typing import Any
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
@@ -58,10 +57,13 @@ class DesktopReader(QWidget):
         source_type: str | None = None,
         weread_chapter: WeReadChapter | None = None,
         open_weread_callback: (
-            Callable[[QWidget, Mapping[str, Any] | None], WeReadChapter | None] | None
+            Callable[[QWidget], WeReadChapter | None] | None
         ) = None,
         switch_book_callback: (
-            Callable[[QWidget, Mapping[str, Any] | None], WeReadChapter | None] | None
+            Callable[[QWidget], WeReadChapter | None] | None
+        ) = None,
+        page_change_callback: (
+            Callable[[QWidget, int], bool] | None
         ) = None,
         chapter_change_callback: (
             Callable[[QWidget, int], bool] | None
@@ -73,7 +75,10 @@ class DesktopReader(QWidget):
     ) -> None:
         super().__init__()
 
-        normalized_state = normalize_config(state)
+        state_to_normalize = dict(state)
+        if source_type is not None:
+            state_to_normalize["source"] = source_type
+        normalized_state = normalize_config(state_to_normalize)
         self.units = self._normalize_units(units)
         if not self.units:
             raise ValueError("没有可显示的阅读内容。")
@@ -83,12 +88,12 @@ class DesktopReader(QWidget):
         self.open_file_callback = open_file_callback
         self.open_weread_callback = open_weread_callback
         self.switch_book_callback = switch_book_callback
+        self.page_change_callback = page_change_callback
         self.chapter_change_callback = chapter_change_callback
         self.chapter_select_callback = chapter_select_callback
         self.shutdown_callback = shutdown_callback
         requested_source = source_type or normalized_state.get("source", "txt")
         self.source_type = requested_source if requested_source in ("txt", "weread") else "txt"
-        self.weread_state = deepcopy(normalized_state["weread"])
         self.book_id = ""
         self.book_title = ""
         self.chapter_id = ""
@@ -99,12 +104,10 @@ class DesktopReader(QWidget):
         if weread_chapter is not None:
             self._set_weread_metadata(weread_chapter)
             self.source_type = "weread"
-        elif self.source_type == "weread":
-            self._load_saved_weread_metadata()
 
-        initial_index = normalized_state.get("index", 0)
-        if self.source_type == "weread" and self.book_id:
-            initial_index = self._saved_line_index(self.book_id, self.chapter_id)
+        initial_index = (
+            0 if self.source_type == "weread" else normalized_state.get("index", 0)
+        )
         self.index = max(0, min(int(initial_index), len(self.units) - 1))
         self.font_size = max(
             MIN_FONT_SIZE,
@@ -197,13 +200,14 @@ class DesktopReader(QWidget):
 
         if self._loading:
             return
-        if (
-            amount > 0
-            and self.source_type == "weread"
-            and self.index + amount >= len(self.units)
-        ):
-            self.change_chapter(1)
-            return
+        if self.source_type == "weread":
+            target = self.index + amount
+            if target >= len(self.units):
+                self.change_page(1)
+                return
+            if target < 0:
+                self.change_page(-1)
+                return
         new_index = max(0, min(self.index + amount, len(self.units) - 1))
         if new_index != self.index:
             self.index = new_index
@@ -225,7 +229,6 @@ class DesktopReader(QWidget):
             self.setWindowOpacity(self.visible_opacity)
 
     def get_state(self, file_path: str | None = None) -> dict[str, Any]:
-        self._remember_current_weread_position()
         position = _clamp_window_position(
             self.pos(),
             self.size(),
@@ -234,7 +237,7 @@ class DesktopReader(QWidget):
         return {
             "source": self.source_type,
             "file": self.file_path if file_path is None else file_path,
-            "index": self.index,
+            "index": 0 if self.source_type == "weread" else self.index,
             "x": position.x(),
             "y": position.y(),
             "width": self.width(),
@@ -244,7 +247,6 @@ class DesktopReader(QWidget):
                 "font_wheel": self.font_wheel_modifier,
                 "opacity_wheel": self.opacity_wheel_modifier,
             },
-            "weread": deepcopy(self.weread_state),
         }
 
     def apply_settings(self, settings: Mapping[str, Any], *, persist: bool = True) -> None:
@@ -323,11 +325,11 @@ class DesktopReader(QWidget):
         self.set_loading_status(f"连接失败：{detail}")
 
     def load_weread_chapter(self, chapter: WeReadChapter) -> None:
-        """Replace startup state text with a ready chapter and restore progress."""
+        """Replace startup state text with the browser's current page."""
 
         self._loading = False
         self._loading_text = ""
-        self._apply_weread_chapter(chapter, restore=True)
+        self._apply_weread_chapter(chapter)
 
     def replace_content(
         self,
@@ -342,7 +344,6 @@ class DesktopReader(QWidget):
         if not normalized_units:
             raise ValueError("没有可显示的阅读内容。")
         self.units = normalized_units
-        self._remember_current_weread_position()
         self.file_path = file_path
         self.source_type = "txt"
         self.index = 0
@@ -355,24 +356,14 @@ class DesktopReader(QWidget):
 
         if self._loading or self.open_weread_callback is None:
             return
-        self._remember_current_weread_position()
-        saved = deepcopy(self.weread_state)
-        self._run_weread_callback(
-            lambda: self.open_weread_callback(self, saved),
-            restore=True,
-        )
+        self._run_weread_callback(lambda: self.open_weread_callback(self))
 
     def switch_weread_book(self) -> None:
         """Let the user choose a book in Chromium and then recapture it."""
 
         if self._loading or self.switch_book_callback is None:
             return
-        self._remember_current_weread_position()
-        saved = deepcopy(self.weread_state)
-        self._run_weread_callback(
-            lambda: self.switch_book_callback(self, saved),
-            restore=True,
-        )
+        self._run_weread_callback(lambda: self.switch_book_callback(self))
 
     def change_chapter(self, direction: int) -> None:
         """Request an adjacent chapter without blocking the Qt event loop."""
@@ -385,6 +376,19 @@ class DesktopReader(QWidget):
             return
         self._begin_chapter_change()
         if not self.chapter_change_callback(self, direction):
+            self._cancel_chapter_change()
+
+    def change_page(self, direction: int) -> None:
+        """Request one adjacent WeRead page without blocking the Qt event loop."""
+
+        if (
+            self._loading
+            or self.page_change_callback is None
+            or direction not in (-1, 1)
+        ):
+            return
+        self._begin_chapter_change()
+        if not self.page_change_callback(self, direction):
             self._cancel_chapter_change()
 
     def choose_chapter(self) -> None:
@@ -420,7 +424,7 @@ class DesktopReader(QWidget):
 
         self._loading = False
         self._loading_text = ""
-        self._apply_weread_chapter(chapter, restore=False)
+        self._apply_weread_chapter(chapter)
         if not self.underMouse():
             self.setWindowOpacity(HIDDEN_OPACITY)
 
@@ -429,6 +433,24 @@ class DesktopReader(QWidget):
 
         self._cancel_chapter_change()
         QMessageBox.warning(self, "章节切换失败", message or "未知错误")
+
+    def finish_page_change(self, chapter: WeReadChapter, direction: int) -> None:
+        """Apply one asynchronously captured page at the requested boundary."""
+
+        if direction not in (-1, 1):
+            self.fail_page_change("翻页方向无效")
+            return
+        self._loading = False
+        self._loading_text = ""
+        self._apply_weread_chapter(chapter, start_at_end=direction < 0)
+        if not self.underMouse():
+            self.setWindowOpacity(HIDDEN_OPACITY)
+
+    def fail_page_change(self, message: str) -> None:
+        """Keep the prior page and line when asynchronous paging fails."""
+
+        self._cancel_chapter_change()
+        QMessageBox.warning(self, "翻页失败", message or "未知错误")
 
     def show_reading_details(self) -> None:
         dialog = ReadingDetailsDialog(self.reading_detail_lines(), self)
@@ -449,10 +471,8 @@ class DesktopReader(QWidget):
             ]
         if self.source_type == "weread":
             return [
-                "当前来源：微信读书",
-                f"当前书籍：《{self.book_title or '未知书籍'}》",
                 f"当前章节：{self.chapter_title or '未知章节'}",
-                f"当前章节进度：{self.index + 1} / {len(self.units)} 行",
+                f"当前页面进度：{self.index + 1} / {len(self.units)} 行",
             ]
         return [
             "当前来源：TXT",
@@ -574,31 +594,31 @@ class DesktopReader(QWidget):
     def _run_weread_callback(
         self,
         callback: Callable[[], WeReadChapter | None],
-        *,
-        restore: bool,
     ) -> None:
-        self._remember_current_weread_position()
         self._dialog_open = True
         self.setWindowOpacity(self.visible_opacity)
         try:
             chapter = callback()
             if chapter is not None:
-                self._apply_weread_chapter(chapter, restore=restore)
+                self._apply_weread_chapter(chapter)
         finally:
             self._dialog_open = False
             if not self.underMouse():
                 self.setWindowOpacity(HIDDEN_OPACITY)
 
-    def _apply_weread_chapter(self, chapter: WeReadChapter, *, restore: bool) -> None:
+    def _apply_weread_chapter(
+        self,
+        chapter: WeReadChapter,
+        *,
+        start_at_end: bool = False,
+    ) -> None:
         units = self._normalize_units(chapter.units)
         if not units:
             raise ValueError("当前章节没有可显示的阅读内容。")
         self.units = units
         self._set_weread_metadata(chapter)
         self.source_type = "weread"
-        self.weread_state["active_book_id"] = chapter.book_id
-        index = self._saved_line_index(chapter.book_id, chapter.chapter_id) if restore else 0
-        self.index = max(0, min(index, len(self.units) - 1))
+        self.index = len(self.units) - 1 if start_at_end else 0
         self._show_current_unit()
         self._persist_state()
 
@@ -612,7 +632,6 @@ class DesktopReader(QWidget):
         self.chapter_catalog_index = chapter.catalog_index
 
     def _begin_chapter_change(self) -> None:
-        self._remember_current_weread_position()
         self._loading = True
         self._loading_text = "文本渲染中…"
         self.label.setText(self._loading_text)
@@ -624,47 +643,6 @@ class DesktopReader(QWidget):
         self._show_current_unit()
         if not self.underMouse():
             self.setWindowOpacity(HIDDEN_OPACITY)
-
-    def _load_saved_weread_metadata(self) -> None:
-        active_id = self.weread_state.get("active_book_id", "")
-        books = self.weread_state.get("books", {})
-        position = books.get(active_id, {}) if isinstance(books, Mapping) else {}
-        if isinstance(position, Mapping):
-            self.book_id = str(position.get("book_id", ""))
-            self.book_title = str(position.get("book_title", ""))
-            self.chapter_id = str(position.get("chapter_id", ""))
-            self.chapter_title = str(position.get("chapter_title", ""))
-            self.chapter_url = str(position.get("chapter_url", ""))
-
-    def _saved_line_index(self, book_id: str, chapter_id: str) -> int:
-        books = self.weread_state.get("books", {})
-        position = books.get(book_id, {}) if isinstance(books, Mapping) else {}
-        if not isinstance(position, Mapping) or position.get("chapter_id") != chapter_id:
-            return 0
-        value = position.get("line_index", 0)
-        return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
-
-    def _current_weread_position(self) -> dict[str, Any] | None:
-        if self.source_type != "weread" or not self.book_id or not self.chapter_id:
-            return None
-        return {
-            "book_id": self.book_id,
-            "book_title": self.book_title,
-            "chapter_id": self.chapter_id,
-            "chapter_title": self.chapter_title,
-            "chapter_url": self.chapter_url,
-            "line_index": self.index,
-        }
-
-    def _remember_current_weread_position(self) -> None:
-        if self._loading:
-            return
-        position = self._current_weread_position()
-        if position is None:
-            return
-        books = self.weread_state.setdefault("books", {})
-        books[position["book_id"]] = position
-        self.weread_state["active_book_id"] = position["book_id"]
 
     def _show_current_unit(self) -> None:
         self.label.setText(self.units[self.index])

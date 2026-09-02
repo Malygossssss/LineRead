@@ -18,7 +18,6 @@ class StartupTests(unittest.TestCase):
         state = {
             "source": "txt",
             "file": "D:/books/old.txt",
-            "weread": {"active_book_id": "", "books": {}},
         }
         app = Mock()
         app.exec.return_value = 17
@@ -39,9 +38,13 @@ class StartupTests(unittest.TestCase):
 
         self.assertEqual(result, 17)
         integration.open.assert_not_called()
-        integration.start.assert_called_once_with(state["weread"])
+        integration.start.assert_called_once_with()
         self.assertEqual(reader_type.call_args.args[0], ["正在连接微信读书…"])
         self.assertEqual(reader_type.call_args.kwargs["source_type"], "weread")
+        self.assertEqual(
+            reader_type.call_args.kwargs["page_change_callback"],
+            integration.change_page,
+        )
         self.assertNotIn("open_file_callback", reader_type.call_args.kwargs)
         reader.set_loading_status.assert_called_once_with("正在连接微信读书…")
         reader.show.assert_called_once()
@@ -113,14 +116,17 @@ class FakeWeReadController:
             "paragraphs": ["正文。"],
         }
 
-    def open_chapter_url(self, url, chapter_id=""):
-        self.calls.append(("open_url", url, chapter_id))
-
     def next_chapter(self):
         self._record("next")
 
     def previous_chapter(self):
         self._record("previous")
+
+    def next_page(self):
+        self._record("next_page")
+
+    def previous_page(self):
+        self._record("previous_page")
 
     def select_chapter(self, chapter_id):
         self._record(("select", chapter_id))
@@ -155,7 +161,7 @@ class WeReadIntegrationTests(unittest.TestCase):
         status_spy = QSignalSpy(integration.startup_status)
         ready_spy = QSignalSpy(integration.startup_ready)
 
-        integration.start(None)
+        integration.start()
 
         integration._startup_future.result(timeout=1)
         self.app.processEvents()
@@ -174,7 +180,7 @@ class WeReadIntegrationTests(unittest.TestCase):
         failed_spy = QSignalSpy(integration.startup_failed)
 
         with patch("main.QMessageBox.warning") as warning:
-            integration.start(None)
+            integration.start()
             integration._startup_future.result(timeout=1)
             self.app.processEvents()
 
@@ -186,7 +192,7 @@ class WeReadIntegrationTests(unittest.TestCase):
         integration = WeReadIntegration(controller, poll_interval_seconds=0)
         self.addCleanup(integration.close)
 
-        integration.start(None)
+        integration.start()
         integration._startup_future.result(timeout=1)
         ready_spy = QSignalSpy(integration.chapter_ready)
 
@@ -210,7 +216,7 @@ class WeReadIntegrationTests(unittest.TestCase):
         self.addCleanup(integration.close)
         ready_spy = QSignalSpy(integration.chapter_ready)
 
-        integration.start(None)
+        integration.start()
         integration._startup_future.result(timeout=1)
         accepted = integration.select_chapter(None, "chapter-6")
         integration._chapter_future.result(timeout=1)
@@ -219,6 +225,38 @@ class WeReadIntegrationTests(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertIn(("select", "chapter-6"), controller.calls)
         self.assertEqual(ready_spy.count(), 1)
+
+    def test_page_turn_runs_asynchronously_and_emits_direction(self):
+        controller = FakeWeReadController()
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        integration.start()
+        integration._startup_future.result(timeout=1)
+        ready_spy = QSignalSpy(integration.page_ready)
+
+        accepted = integration.change_page(None, -1)
+        integration._page_future.result(timeout=1)
+        self.app.processEvents()
+
+        self.assertTrue(accepted)
+        self.assertIn("previous_page", controller.calls)
+        self.assertEqual(ready_spy.count(), 1)
+        self.assertIsInstance(ready_spy.at(0)[0], WeReadChapter)
+        self.assertEqual(ready_spy.at(0)[1], -1)
+
+    def test_page_turn_error_is_emitted_without_worker_message_box(self):
+        controller = FakeWeReadController(error=WeReadError("页面读取失败"))
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        failed_spy = QSignalSpy(integration.page_failed)
+
+        with patch("main.QMessageBox.warning") as warning:
+            self.assertTrue(integration.change_page(None, 1))
+            integration._page_future.result(timeout=1)
+            self.app.processEvents()
+
+        self.assertEqual(failed_spy.at(0)[0], "页面读取失败")
+        warning.assert_not_called()
 
     def test_async_chapter_error_is_emitted_without_worker_message_box(self):
         controller = FakeWeReadController(error=WeReadError("正文读取失败"))
@@ -234,29 +272,15 @@ class WeReadIntegrationTests(unittest.TestCase):
         self.assertEqual(failed_spy.at(0)[0], "正文读取失败")
         warning.assert_not_called()
 
-    def test_saved_chapter_url_is_restored_for_selected_book(self):
+    def test_open_uses_the_current_browser_chapter_without_saved_state(self):
         controller = FakeWeReadController()
         integration = WeReadIntegration(controller)
-        state = {
-            "books": {
-                "book-1": {
-                    "chapter_id": "chapter-9",
-                    "chapter_url": "https://weread.qq.com/web/reader/book-1-chapter-9",
-                }
-            }
-        }
 
-        chapter = integration.open(None, state)
+        chapter = integration.open(None)
 
         self.assertIsNotNone(chapter)
-        self.assertIn(
-            (
-                "open_url",
-                "https://weread.qq.com/web/reader/book-1-chapter-9",
-                "chapter-9",
-            ),
-            controller.calls,
-        )
+        self.assertNotIn("open_url", controller.calls)
+        self.assertEqual(chapter.chapter_id, "chapter-1")
 
 
 if __name__ == "__main__":

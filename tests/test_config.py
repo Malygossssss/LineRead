@@ -89,10 +89,16 @@ class ConfigTests(unittest.TestCase):
 
             save_config(state, path)
 
-            self.assertEqual(load_config(path), state)
+            expected = {
+                key: value
+                for key, value in state.items()
+                if key != "weread"
+            }
+            expected["index"] = 0
+            self.assertEqual(load_config(path), expected)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 
-    def test_invalid_weread_state_is_safely_discarded(self):
+    def test_legacy_weread_progress_is_discarded(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             path = Path(directory) / "config.json"
             path.write_text(
@@ -119,18 +125,8 @@ class ConfigTests(unittest.TestCase):
             loaded = load_config(path)
 
             self.assertEqual(loaded["source"], "weread")
-            self.assertEqual(loaded["weread"]["active_book_id"], "")
-            self.assertEqual(
-                loaded["weread"]["books"]["book-2"],
-                {
-                    "book_id": "book-2",
-                    "book_title": "",
-                    "chapter_id": "chapter-2",
-                    "chapter_title": "",
-                    "chapter_url": "",
-                    "line_index": 0,
-                },
-            )
+            self.assertNotIn("weread", loaded)
+            self.assertEqual(loaded["index"], 0)
 
     def test_invalid_and_conflicting_shortcuts_are_repaired(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:

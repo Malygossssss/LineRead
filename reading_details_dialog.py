@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout, QW
 
 
 class ReadingDetailsDialog(QDialog):
-    """Show compact source, book/chapter, and line progress information."""
+    """Show compact chapter/page or file/line progress information."""
 
     def __init__(self, lines: Sequence[str], parent: QWidget | None = None) -> None:
         super().__init__(parent)

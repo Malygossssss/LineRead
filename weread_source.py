@@ -50,7 +50,7 @@ class WeReadCatalogEntry:
 
 @dataclass(frozen=True)
 class WeReadChapter:
-    """A fully cached, display-ready chapter snapshot."""
+    """A display-ready snapshot of the current page in one chapter."""
 
     book_id: str
     book_title: str
@@ -172,14 +172,14 @@ class WeReadController:
             raise WeReadError("等待微信读书打开书籍超时，请进入一本书后重试。") from exc
 
     def get_current_chapter(self) -> Mapping[str, Any]:
-        """Extract the currently rendered chapter from public page DOM nodes."""
+        """Extract only the currently visible horizontal reading page."""
 
         self.connect()
         if not self.is_reader_page():
             raise WeReadError("请先在微信读书浏览器中进入一本书。")
         try:
             self._wait_for_chapter_render()
-            self._ensure_vertical_layout()
+            self._ensure_horizontal_layout()
             self._wait_for_chapter_render()
             catalog_position = self._catalog_position()
             payload = self.page.evaluate(_EXTRACT_CURRENT_CHAPTER)
@@ -202,11 +202,27 @@ class WeReadController:
             or not isinstance(paragraphs, list)
             or not any(_text(item) for item in paragraphs)
         ):
-            result["paragraphs"] = _reconcile_visual_rows(
-                self._ocr_current_canvas(),
-                paragraphs,
+            visual_rows = _strip_page_chrome(
+                self._read_current_page_visual_rows(),
+                _text(result.get("book_title")),
+                _text(result.get("chapter_title")),
             )
+            if visual_rows:
+                result["paragraphs"] = _reconcile_visual_rows(
+                    visual_rows,
+                    paragraphs,
+                )
         return result
+
+    def next_page(self) -> None:
+        """Turn to the next rendered page without preloading the chapter."""
+
+        self._turn_page(1)
+
+    def previous_page(self) -> None:
+        """Turn to the previous rendered page without preloading the chapter."""
+
+        self._turn_page(-1)
 
     def next_chapter(self) -> None:
         self._change_chapter(1)
@@ -244,23 +260,6 @@ class WeReadController:
                 self.page.bring_to_front()
             except Exception as exc:
                 raise WeReadError("无法恢复微信读书窗口。") from exc
-
-    def open_chapter_url(self, url: str, chapter_id: str = "") -> None:
-        """Open a previously captured WeRead chapter URL in the same browser."""
-
-        if not _is_safe_weread_reader_url(url):
-            raise WeReadError("保存的微信读书章节地址无效。")
-        try:
-            self.connect().goto(url, wait_until="domcontentloaded")
-            if chapter_id.startswith(CATALOG_CHAPTER_PREFIX):
-                self.page.wait_for_function(
-                    "() => document.querySelectorAll('.readerCatalog_list_item').length > 0",
-                    timeout=20_000,
-                )
-                self._select_catalog_chapter(chapter_id)
-            self._wait_for_chapter_render()
-        except Exception as exc:
-            raise WeReadError("无法恢复保存的微信读书章节。") from exc
 
     def close(self) -> None:
         context, playwright = self._context, self._playwright
@@ -343,18 +342,66 @@ class WeReadController:
                 f"Chrome：{_error_summary(chrome_error)}"
             ) from chrome_error
 
-    def _ensure_vertical_layout(self) -> None:
-        """Use WeRead's own layout control when horizontal mode is active."""
+    def _ensure_horizontal_layout(self) -> None:
+        """Use WeRead's own control to keep the reader in paginated mode."""
 
-        toggle = self.page.locator(".readerControls_item.isHorizontalReader")
-        if toggle.count() == 0 or not toggle.first.is_visible():
+        horizontal = self.page.locator(".wr_horizontalReader")
+        if horizontal.count() and horizontal.first.is_visible():
             return
+
+        # The layout button has no accessible label in the current reader. Its
+        # stable position is immediately after the book-review control and
+        # before the font-size control in both layouts.
+        toggle = self.page.locator(
+            ".readerControls_item.showBookReviews + .readerControls_item"
+        )
+        if toggle.count() == 0 or not toggle.first.is_visible():
+            raise WeReadError("无法切换微信读书为翻页模式。")
         toggle.first.click()
         self.page.wait_for_function(
-            "() => !document.querySelector('.wr_horizontalReader')",
+            "() => !!document.querySelector('.wr_horizontalReader')",
             timeout=10_000,
         )
         self.page.wait_for_timeout(300)
+
+    def _turn_page(self, direction: int) -> None:
+        """Click one public pager control and wait for a different render."""
+
+        if direction not in (-1, 1):
+            raise ValueError("翻页方向必须是 -1 或 1。")
+        self._ensure_horizontal_layout()
+        label = "下一页" if direction > 0 else "上一页"
+        boundary = "最后一页" if direction > 0 else "第一页"
+        selector = (
+            ".renderTarget_pager_button.renderTarget_pager_button_right"
+            if direction > 0
+            else ".renderTarget_pager_button:not(.renderTarget_pager_button_right)"
+        )
+        button = self.page.locator(selector)
+        if (
+            button.count() == 0
+            or not button.first.is_visible()
+            or not button.first.is_enabled()
+        ):
+            raise WeReadError(f"当前已经是{boundary}。")
+
+        before = self._page_signature()
+        try:
+            button.first.click()
+            self.page.wait_for_function(
+                _CURRENT_PAGE_CHANGED,
+                before,
+                polling=100,
+                timeout=20_000,
+            )
+            self.page.wait_for_timeout(250)
+            self._wait_for_chapter_render()
+        except Exception as exc:
+            raise WeReadError(f"微信读书{label}失败，请稍后重试。") from exc
+
+    def _page_signature(self) -> str:
+        value = self.page.evaluate(_EXTRACT_CURRENT_PAGE_SIGNATURE)
+        return value if isinstance(value, str) else ""
 
     def _wait_for_chapter_render(self) -> None:
         """Wait past WeRead's small asynchronous loading shell."""
@@ -436,9 +483,66 @@ class WeReadController:
         )
         self.page.wait_for_timeout(500)
 
-    def _ocr_current_canvas(self) -> list[str]:
-        canvas_locator = self.page.locator(".readerChapterContent canvas")
+    def _read_current_page_visual_rows(self) -> list[str]:
+        """Read visible Canvas and positioned text without turning or scrolling."""
+
+        rows = self._ocr_current_page_canvases()
+        positioned = tuple(self._current_page_positioned_text_rows())
+        if positioned:
+            _extend_with_boundary_overlap(rows, positioned)
+        return rows
+
+    def _ocr_current_page_canvases(self) -> list[str]:
+        """OCR only canvases mounted in the current horizontal render target."""
+
+        canvas_locator = self.page.locator(".renderTargetContainer canvas")
+        count = canvas_locator.count()
+        if count == 0:
+            return []
+
+        engine = self._get_ocr_engine()
+        texts: list[str] = []
+        seen_canvas_hashes: set[bytes] = set()
+        for canvas_index in range(count):
+            canvas = (
+                canvas_locator.first
+                if canvas_index == 0
+                else canvas_locator.nth(canvas_index)
+            )
+            if not canvas.is_visible():
+                continue
+            screenshot = _canvas_png(canvas)
+            screenshot_hash = hashlib.sha256(screenshot).digest()
+            if screenshot_hash in seen_canvas_hashes:
+                continue
+            seen_canvas_hashes.add(screenshot_hash)
+            lines = _ocr_canvas_lines(engine, screenshot, ignore_header=False)
+            _extend_with_boundary_overlap(
+                texts,
+                tuple(line.text for line in lines),
+            )
+        return texts
+
+    def _current_page_positioned_text_rows(self) -> list[str]:
+        """Rebuild only positioned characters mounted in the current page."""
+
         try:
+            payload = self.page.evaluate(_EXTRACT_CURRENT_PAGE_POSITIONED_TEXT)
+        except Exception:
+            return []
+        if not isinstance(payload, Mapping):
+            return []
+        return _positioned_rows(payload.get("characters"))
+
+    def _ocr_current_canvas(self) -> list[str]:
+        """Legacy full-chapter scanner retained for compatibility tests."""
+
+        canvas_locator = self.page.locator(".readerChapterContent canvas")
+        initial_scroll_state: Mapping[str, Any] | None = None
+        try:
+            scroll_state = self.page.evaluate(_MOVE_CANVAS_DISCOVERY, "current")
+            if isinstance(scroll_state, Mapping):
+                initial_scroll_state = scroll_state
             engine: Any = None
             texts: list[str] = []
             seen_canvas_hashes: set[bytes] = set()
@@ -533,6 +637,17 @@ class WeReadController:
             raise
         except Exception as exc:
             raise WeReadError("本地 OCR 无法识别当前章节。") from exc
+        finally:
+            if initial_scroll_state is not None:
+                position = initial_scroll_state.get("position")
+                if isinstance(position, (int, float)) and not isinstance(position, bool):
+                    try:
+                        self.page.evaluate(
+                            _MOVE_CANVAS_DISCOVERY,
+                            {"position": position},
+                        )
+                    except Exception:
+                        pass
         if not texts:
             raise WeReadError("本地 OCR 没有识别到当前章节正文。")
         return texts
@@ -853,11 +968,11 @@ def _ocr_fragment_separator(left: _OcrLine, right: _OcrLine) -> str:
 
 
 def _positioned_rows(value: Any) -> list[str]:
-    """Group shuffled positioned characters by y, then sort each row by x."""
+    """Group positioned characters by visible page and y, then sort by x."""
 
     if not isinstance(value, list):
         return []
-    rows: dict[int, dict[float, str]] = {}
+    rows: dict[tuple[int, int], dict[float, str]] = {}
     for item in value:
         if not isinstance(item, Mapping):
             continue
@@ -873,15 +988,40 @@ def _positioned_rows(value: Any) -> list[str]:
         cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
         if not cleaned:
             continue
-        row = rows.setdefault(round(float(y)), {})
+        raw_page = item.get("page", 0)
+        page_number = (
+            int(raw_page)
+            if isinstance(raw_page, (int, float)) and not isinstance(raw_page, bool)
+            else 0
+        )
+        row = rows.setdefault((page_number, round(float(y))), {})
         row.setdefault(round(float(x), 2), cleaned)
 
     result: list[str] = []
-    for y in sorted(rows):
-        text = "".join(rows[y][x] for x in sorted(rows[y])).strip()
+    for row_key in sorted(rows):
+        text = "".join(rows[row_key][x] for x in sorted(rows[row_key])).strip()
         if text:
             result.append(text)
     return result
+
+
+def _strip_page_chrome(
+    rows: list[str],
+    book_title: str,
+    chapter_title: str,
+) -> list[str]:
+    """Remove exact reader chrome labels while retaining real body lines."""
+
+    excluded = {
+        _clean_render_text(value)
+        for value in (book_title, chapter_title, "上一页", "下一页")
+        if _clean_render_text(value)
+    }
+    return [
+        cleaned
+        for row in rows
+        if (cleaned := _clean_render_text(row)) and cleaned not in excluded
+    ]
 
 
 def _reconcile_visual_rows(
@@ -964,7 +1104,7 @@ def _same_detected_line(first: _OcrLine, second: _OcrLine) -> bool:
 
 
 class WeReadSource(ReaderSource):
-    """Convert controller DOM payloads into cached single-line units."""
+    """Convert the current rendered page into cached single-line units."""
 
     def __init__(
         self,
@@ -994,6 +1134,14 @@ class WeReadSource(ReaderSource):
         self.controller.previous_chapter()
         return self.load_current_chapter()
 
+    def next_page(self) -> WeReadChapter:
+        self.controller.next_page()
+        return self.load_current_chapter()
+
+    def previous_page(self) -> WeReadChapter:
+        self.controller.previous_page()
+        return self.load_current_chapter()
+
     def select_chapter(self, chapter_id: str) -> WeReadChapter:
         self.controller.select_chapter(chapter_id)
         return self.load_current_chapter()
@@ -1003,10 +1151,6 @@ class WeReadSource(ReaderSource):
 
     def switch_book(self) -> WeReadChapter:
         self.restore_window()
-        return self.load_current_chapter()
-
-    def restore_chapter(self, chapter_url: str, chapter_id: str = "") -> WeReadChapter:
-        self.controller.open_chapter_url(chapter_url, chapter_id)
         return self.load_current_chapter()
 
     def close(self) -> None:
@@ -1106,12 +1250,6 @@ def _is_blank_page_url(url: Any) -> bool:
 def _stable_id(prefix: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
     return f"{prefix}-{digest}"
-
-
-def _is_safe_weread_reader_url(url: str) -> bool:
-    return bool(
-        re.fullmatch(r"https://weread\.qq\.com/web/reader/[^\s]+", url.strip())
-    )
 
 
 def _catalog_index(chapter_id: str) -> int | None:
@@ -1230,6 +1368,99 @@ _CHAPTER_RENDER_READY = r"""
 """
 
 
+_EXTRACT_CURRENT_PAGE_SIGNATURE = r"""
+() => {
+  const root = document.querySelector('.renderTargetContainer') ||
+    document.querySelector('.readerChapterContent');
+  if (!root) return '';
+  const visible = (node) => {
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+      rect.top < window.innerHeight && rect.left < window.innerWidth;
+  };
+  const hash = (value) => {
+    let result = 2166136261;
+    const step = Math.max(1, Math.floor(value.length / 4096));
+    for (let index = 0; index < value.length; index += step) {
+      result ^= value.charCodeAt(index);
+      result = Math.imul(result, 16777619);
+    }
+    return (result >>> 0).toString(16);
+  };
+  const selected = Array.from(
+    document.querySelectorAll('.readerCatalog_list_item')
+  ).findIndex(node => node.classList.contains('readerCatalog_list_item_selected'));
+  const text = Array.from(root.querySelectorAll(
+    'p, h1, h2, h3, [data-wr-role="text"]'
+  )).filter(visible).map(node => {
+    const rect = node.getBoundingClientRect();
+    return `${Math.round(rect.left)},${Math.round(rect.top)}:${node.textContent || ''}`;
+  }).join('|');
+  const canvases = Array.from(root.querySelectorAll('canvas')).filter(visible).map(
+    canvas => {
+      try {
+        const pixels = canvas.toDataURL('image/png');
+        return `${canvas.width}x${canvas.height}:${pixels.length}:${hash(pixels)}`;
+      } catch (error) {
+        const rect = canvas.getBoundingClientRect();
+        return `${canvas.width}x${canvas.height}:${Math.round(rect.left)},${Math.round(rect.top)}`;
+      }
+    }
+  ).join('|');
+  return `${selected}:${hash(text)}:${canvases}`;
+}
+"""
+
+
+_CURRENT_PAGE_CHANGED = r"""
+(previous) => {
+  const root = document.querySelector('.renderTargetContainer') ||
+    document.querySelector('.readerChapterContent');
+  if (!root) return false;
+  const visible = (node) => {
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+      rect.top < window.innerHeight && rect.left < window.innerWidth;
+  };
+  const hash = (value) => {
+    let result = 2166136261;
+    const step = Math.max(1, Math.floor(value.length / 4096));
+    for (let index = 0; index < value.length; index += step) {
+      result ^= value.charCodeAt(index);
+      result = Math.imul(result, 16777619);
+    }
+    return (result >>> 0).toString(16);
+  };
+  const selected = Array.from(
+    document.querySelectorAll('.readerCatalog_list_item')
+  ).findIndex(node => node.classList.contains('readerCatalog_list_item_selected'));
+  const text = Array.from(root.querySelectorAll(
+    'p, h1, h2, h3, [data-wr-role="text"]'
+  )).filter(visible).map(node => {
+    const rect = node.getBoundingClientRect();
+    return `${Math.round(rect.left)},${Math.round(rect.top)}:${node.textContent || ''}`;
+  }).join('|');
+  const canvases = Array.from(root.querySelectorAll('canvas')).filter(visible).map(
+    canvas => {
+      try {
+        const pixels = canvas.toDataURL('image/png');
+        return `${canvas.width}x${canvas.height}:${pixels.length}:${hash(pixels)}`;
+      } catch (error) {
+        const rect = canvas.getBoundingClientRect();
+        return `${canvas.width}x${canvas.height}:${Math.round(rect.left)},${Math.round(rect.top)}`;
+      }
+    }
+  ).join('|');
+  const current = `${selected}:${hash(text)}:${canvases}`;
+  return !!current && current !== previous;
+}
+"""
+
+
 _EXTRACT_CANVAS_DATA_URL = r"""
 (canvas) => {
   if (!(canvas instanceof HTMLCanvasElement) || !canvas.width || !canvas.height) {
@@ -1240,6 +1471,50 @@ _EXTRACT_CANVAS_DATA_URL = r"""
   } catch (error) {
     return '';
   }
+}
+"""
+
+
+_EXTRACT_CURRENT_PAGE_POSITIONED_TEXT = r"""
+() => {
+  const root = document.querySelector('.renderTargetContainer');
+  if (!root) return {characters: []};
+  const rootRect = root.getBoundingClientRect();
+  const visible = (node) => {
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+      rect.top < window.innerHeight && rect.left < window.innerWidth;
+  };
+  const visiblePages = Array.from(root.querySelectorAll('.page_show'))
+    .filter(visible)
+    .sort((first, second) =>
+      first.getBoundingClientRect().left - second.getBoundingClientRect().left
+    );
+  const visibleCanvases = Array.from(root.querySelectorAll('canvas')).filter(visible);
+  const twoPage = visiblePages.length > 1 || visibleCanvases.length > 1;
+  const midpoint = rootRect.left + rootRect.width / 2;
+  const characters = [];
+  for (const node of root.querySelectorAll('[data-wr-role="text"]')) {
+    if (!visible(node)) continue;
+    const text = node.textContent || '';
+    if (!text) continue;
+    const rect = node.getBoundingClientRect();
+    const pageNode = node.closest('.page_left, .page_right');
+    let page = pageNode ? visiblePages.indexOf(pageNode) : -1;
+    if (page < 0) page = twoPage && rect.left >= midpoint ? 1 : 0;
+    const pageRect = pageNode && visible(pageNode)
+      ? pageNode.getBoundingClientRect()
+      : rootRect;
+    characters.push({
+      page,
+      x: rect.left - pageRect.left,
+      y: rect.top - pageRect.top,
+      text
+    });
+  }
+  return {characters};
 }
 """
 
@@ -1313,17 +1588,26 @@ _MOVE_CANVAS_DISCOVERY = r"""
   const viewportHeight = documentScroller ? window.innerHeight : scroller.clientHeight;
   const before = documentScroller ? window.scrollY : scroller.scrollTop;
   const maximum = Math.max(0, scroller.scrollHeight - viewportHeight);
-  const target = action === 'top' ? 0 : Math.min(
-      maximum,
-      before + Math.max(200, Math.floor(viewportHeight * 0.8))
-    );
+  const requestedPosition = action && typeof action === 'object'
+    ? Number(action.position)
+    : NaN;
+  const target = action === 'top' ? 0 : (
+    action === 'current' ? before : (
+      Number.isFinite(requestedPosition)
+        ? Math.max(0, Math.min(maximum, requestedPosition))
+        : Math.min(
+            maximum,
+            before + Math.max(200, Math.floor(viewportHeight * 0.8))
+          )
+    )
+  );
   if (documentScroller) {
     window.scrollTo(0, target);
   } else {
     scroller.scrollTop = target;
   }
   const after = documentScroller ? window.scrollY : scroller.scrollTop;
-  if (action !== 'top' && after >= maximum - 2 && after <= before + 1) {
+  if (action === 'next' && after >= maximum - 2 && after <= before + 1) {
     scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
     if (!documentScroller) {
       window.dispatchEvent(new Event('scroll'));
@@ -1347,12 +1631,14 @@ _EXTRACT_CURRENT_CHAPTER = r"""
     const style = window.getComputedStyle(node);
     const rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' &&
-      rect.width > 0 && rect.height > 0;
+      rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+      rect.top < window.innerHeight && rect.left < window.innerWidth;
   };
   const chapter = document.querySelector('.readerChapterContent');
   if (!chapter) return null;
+  const renderRoot = chapter.querySelector('.renderTargetContainer') || chapter;
 
-  const paragraphNodes = Array.from(chapter.querySelectorAll('p')).filter(visible);
+  const paragraphNodes = Array.from(renderRoot.querySelectorAll('p')).filter(visible);
   const paragraphs = [];
   for (const node of paragraphNodes) {
     const text = clean(node.innerText || node.textContent);
@@ -1401,10 +1687,12 @@ _EXTRACT_CURRENT_CHAPTER = r"""
     chapter_title: selectedTitle || firstText([
       '.renderTargetPageInfo_header_chapterTitle', 'h1', 'h2', 'h3',
       '[class*="chapterTitle"]', '[class*="chapter_title"]'
-    ], chapter) || firstText(['[class*="readerTopBar_chapter"]']),
+    ], renderRoot) || firstText(['[class*="readerTopBar_chapter"]']),
     chapter_url: window.location.href,
-    has_canvas: !!chapter.querySelector('canvas'),
-    uses_visual_renderer: !!chapter.querySelector('[data-wr-role="text"]'),
+    has_canvas: Array.from(renderRoot.querySelectorAll('canvas')).some(visible),
+    uses_visual_renderer: Array.from(
+      renderRoot.querySelectorAll('[data-wr-role="text"]')
+    ).some(visible),
     paragraphs
   };
 }

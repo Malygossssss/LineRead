@@ -5,12 +5,11 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Any, Mapping
+from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
@@ -38,6 +37,8 @@ class WeReadIntegration(QObject):
     startup_failed = Signal(str)
     chapter_ready = Signal(object)
     chapter_failed = Signal(str)
+    page_ready = Signal(object, int)
+    page_failed = Signal(str)
 
     def __init__(
         self,
@@ -58,6 +59,7 @@ class WeReadIntegration(QObject):
         self._executor: ThreadPoolExecutor | None = None
         self._startup_future: Future[Any] | None = None
         self._chapter_future: Future[Any] | None = None
+        self._page_future: Future[Any] | None = None
         self._stop_event = Event()
 
     @property
@@ -75,35 +77,28 @@ class WeReadIntegration(QObject):
     def open(
         self,
         parent: QWidget | None,
-        saved_state: Mapping[str, Any] | None = None,
     ) -> WeReadChapter | None:
-        """Recapture the current book without showing a login confirmation dialog."""
+        """Recapture the chapter currently open in the WeRead browser."""
 
         try:
-            saved = deepcopy(saved_state) if isinstance(saved_state, Mapping) else None
-            return self._run_sync(lambda: self._open_worker(saved))
+            return self._run_sync(self._open_worker)
         except WeReadError as exc:
             QMessageBox.warning(parent, "微信读书连接失败", str(exc))
             return None
 
-    def start(self, saved_state: Mapping[str, Any] | None = None) -> None:
+    def start(self) -> None:
         """Begin non-blocking login, book-selection, and chapter rendering."""
 
         if self._startup_future is not None and not self._startup_future.done():
             return
-        saved = deepcopy(saved_state) if isinstance(saved_state, Mapping) else None
         self._stop_event.clear()
-        self._startup_future = self._ensure_executor().submit(
-            self._startup_worker,
-            saved,
-        )
+        self._startup_future = self._ensure_executor().submit(self._startup_worker)
 
     def switch_book(
         self,
         parent: QWidget | None,
-        saved_state: Mapping[str, Any] | None,
     ) -> WeReadChapter | None:
-        """Give the browser to the user, then capture and resume the chosen book."""
+        """Give the browser to the user, then capture its selected chapter."""
 
         try:
             self._run_sync(self._prepare_book_switch)
@@ -111,10 +106,9 @@ class WeReadIntegration(QObject):
                 parent,
                 "切换微信读书书籍",
                 "请在微信读书浏览器中手动选择并进入新书。\n\n"
-                "完成后回到此提示并点击“确定”，LineRead 将从保存位置继续。",
+                "完成后回到此提示并点击“确定”，LineRead 将从当前页面第一行开始。",
             )
-            saved = deepcopy(saved_state) if isinstance(saved_state, Mapping) else None
-            return self._run_sync(lambda: self._wait_and_load_worker(saved))
+            return self._run_sync(self._wait_and_load_worker)
         except WeReadError as exc:
             QMessageBox.warning(parent, "切换书籍失败", str(exc))
             return None
@@ -145,6 +139,19 @@ class WeReadIntegration(QObject):
             lambda: self.source.select_chapter(chapter_id)
         )
 
+    def change_page(
+        self,
+        parent: QWidget | None,
+        direction: int,
+    ) -> bool:
+        """Queue one browser page turn and return without blocking Qt."""
+
+        if direction == 1:
+            return self._submit_page_change(self.source.next_page, direction)
+        if direction == -1:
+            return self._submit_page_change(self.source.previous_page, direction)
+        return False
+
     def close(self) -> None:
         self._stop_event.set()
         executor = self._executor
@@ -154,7 +161,9 @@ class WeReadIntegration(QObject):
 
         worker_running = (
             self._startup_future is not None and not self._startup_future.done()
-        ) or (self._chapter_future is not None and not self._chapter_future.done())
+        ) or (
+            self._chapter_future is not None and not self._chapter_future.done()
+        ) or (self._page_future is not None and not self._page_future.done())
         try:
             close_future = executor.submit(self._close_worker)
             if not worker_running:
@@ -165,7 +174,7 @@ class WeReadIntegration(QObject):
             executor.shutdown(wait=False, cancel_futures=False)
             self._executor = None
 
-    def _startup_worker(self, saved_state: Mapping[str, Any] | None) -> None:
+    def _startup_worker(self) -> None:
         try:
             self.startup_status.emit(STARTUP_CONNECTING_TEXT)
             self.source.connect()
@@ -194,35 +203,26 @@ class WeReadIntegration(QObject):
                 return
             self.startup_status.emit(STARTUP_RENDERING_TEXT)
             chapter = self.source.load_current_chapter()
-            chapter = self._restore_saved_chapter(chapter, saved_state)
             if not self._stop_event.is_set():
                 self.startup_ready.emit(chapter)
         except Exception as exc:
             if not self._stop_event.is_set():
                 self.startup_failed.emit(_error_message(exc))
 
-    def _open_worker(
-        self,
-        saved_state: Mapping[str, Any] | None,
-    ) -> WeReadChapter:
+    def _open_worker(self) -> WeReadChapter:
         self.source.connect()
         self.source.restore_window()
         if self.controller.readiness_state() != "reader":
             self.controller.wait_for_reader()
-        chapter = self.source.load_current_chapter()
-        return self._restore_saved_chapter(chapter, saved_state)
+        return self.source.load_current_chapter()
 
     def _prepare_book_switch(self) -> None:
         self.source.connect()
         self.source.restore_window()
 
-    def _wait_and_load_worker(
-        self,
-        saved_state: Mapping[str, Any] | None,
-    ) -> WeReadChapter:
+    def _wait_and_load_worker(self) -> WeReadChapter:
         self.controller.wait_for_reader()
-        chapter = self.source.load_current_chapter()
-        return self._restore_saved_chapter(chapter, saved_state)
+        return self.source.load_current_chapter()
 
     def _ensure_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -242,6 +242,8 @@ class WeReadIntegration(QObject):
             return False
         if self._chapter_future is not None and not self._chapter_future.done():
             return False
+        if self._page_future is not None and not self._page_future.done():
+            return False
         self._chapter_future = self._ensure_executor().submit(
             self._chapter_worker,
             callback,
@@ -257,6 +259,39 @@ class WeReadIntegration(QObject):
             if not self._stop_event.is_set():
                 self.chapter_failed.emit(_error_message(exc))
 
+    def _submit_page_change(
+        self,
+        callback: Callable[[], WeReadChapter],
+        direction: int,
+    ) -> bool:
+        if self._stop_event.is_set():
+            return False
+        if self._startup_future is not None and not self._startup_future.done():
+            return False
+        if self._chapter_future is not None and not self._chapter_future.done():
+            return False
+        if self._page_future is not None and not self._page_future.done():
+            return False
+        self._page_future = self._ensure_executor().submit(
+            self._page_worker,
+            callback,
+            direction,
+        )
+        return True
+
+    def _page_worker(
+        self,
+        callback: Callable[[], WeReadChapter],
+        direction: int,
+    ) -> None:
+        try:
+            chapter = callback()
+            if not self._stop_event.is_set():
+                self.page_ready.emit(chapter, direction)
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self.page_failed.emit(_error_message(exc))
+
     def _run_sync(self, callback: Callable[[], Any]) -> Any:
         if self._executor is None:
             return callback()
@@ -267,31 +302,6 @@ class WeReadIntegration(QObject):
             self._source.close()
         elif self._controller is not None:
             self._controller.close()
-
-    def _restore_saved_chapter(
-        self,
-        chapter: WeReadChapter,
-        saved_state: Mapping[str, Any] | None,
-    ) -> WeReadChapter:
-        if not isinstance(saved_state, Mapping):
-            return chapter
-        books = saved_state.get("books")
-        if not isinstance(books, Mapping):
-            return chapter
-        position = books.get(chapter.book_id)
-        if not isinstance(position, Mapping):
-            return chapter
-        saved_id = position.get("chapter_id")
-        saved_url = position.get("chapter_url")
-        if (
-            isinstance(saved_id, str)
-            and saved_id
-            and saved_id != chapter.chapter_id
-            and isinstance(saved_url, str)
-            and saved_url
-        ):
-            return self.source.restore_chapter(saved_url, saved_id)
-        return chapter
 
 
 def main() -> int:
@@ -318,6 +328,7 @@ def main() -> int:
             source_type="weread",
             open_weread_callback=integration.open,
             switch_book_callback=integration.switch_book,
+            page_change_callback=integration.change_page,
             chapter_change_callback=integration.change_chapter,
             chapter_select_callback=integration.select_chapter,
             shutdown_callback=integration.close,
@@ -328,9 +339,11 @@ def main() -> int:
         integration.startup_failed.connect(reader.show_loading_error)
         integration.chapter_ready.connect(reader.finish_chapter_change)
         integration.chapter_failed.connect(reader.fail_chapter_change)
+        integration.page_ready.connect(reader.finish_page_change)
+        integration.page_failed.connect(reader.fail_page_change)
         instance_guard.activation_requested.connect(reader.restore_and_activate)
         reader.show()
-        integration.start(state.get("weread"))
+        integration.start()
         return app.exec()
     finally:
         instance_guard.close()

@@ -73,6 +73,20 @@ class FakeController:
     def previous_chapter(self):
         self.calls.append("previous")
 
+    def next_page(self):
+        self.calls.append("next_page")
+        self.payload = {
+            **self.payload,
+            "paragraphs": ["下一页第一行。", "下一页第二行。"],
+        }
+
+    def previous_page(self):
+        self.calls.append("previous_page")
+        self.payload = {
+            **self.payload,
+            "paragraphs": ["上一页第一行。", "上一页第二行。"],
+        }
+
     def select_chapter(self, chapter_id):
         self.calls.append(("select", chapter_id))
         self.payload = {
@@ -132,6 +146,20 @@ class WeReadSourceTests(unittest.TestCase):
         self.assertEqual(controller.calls, [("select", "chapter-2"), "current"])
         self.assertEqual(chapter.chapter_id, "chapter-2")
         self.assertEqual(chapter.units, ("直接选中的正文。",))
+
+    def test_page_turns_delegate_then_refresh_the_current_page(self):
+        controller = FakeController()
+        source = WeReadSource(controller)
+
+        next_page = source.next_page()
+        previous_page = source.previous_page()
+
+        self.assertEqual(
+            controller.calls,
+            ["next_page", "current", "previous_page", "current"],
+        )
+        self.assertEqual(next_page.units[0], "下一页第一行。")
+        self.assertEqual(previous_page.units[-1], "上一页第二行。")
 
     def test_missing_book_title_or_body_is_rejected(self):
         controller = FakeController()
@@ -345,7 +373,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         }
 
         with (
-            patch.object(controller, "_ensure_vertical_layout") as ensure_vertical,
+            patch.object(controller, "_ensure_horizontal_layout") as ensure_horizontal,
             patch.object(
                 controller,
                 "_catalog_position",
@@ -365,13 +393,13 @@ class WeReadControllerChapterTests(unittest.TestCase):
             ),
             patch.object(
                 controller,
-                "_ocr_current_canvas",
+                "_read_current_page_visual_rows",
                 return_value=["正文第一行。", "正文第二行。"],
             ) as ocr,
         ):
             payload = controller.get_current_chapter()
 
-        ensure_vertical.assert_called_once()
+        ensure_horizontal.assert_called_once()
         ocr.assert_called_once()
         self.assertEqual(payload["chapter_id"], "catalog:stable-seven")
         self.assertEqual(payload["chapter_title"], "第七章")
@@ -390,7 +418,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         }
 
         with (
-            patch.object(controller, "_ensure_vertical_layout"),
+            patch.object(controller, "_ensure_horizontal_layout"),
             patch.object(
                 controller,
                 "_catalog_position",
@@ -404,7 +432,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
             ),
             patch.object(
                 controller,
-                "_ocr_current_canvas",
+                "_read_current_page_visual_rows",
                 return_value=["页面第一行。", "页面第二行。"],
             ) as ocr,
         ):
@@ -427,7 +455,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
         }
 
         with (
-            patch.object(controller, "_ensure_vertical_layout"),
+            patch.object(controller, "_ensure_horizontal_layout"),
             patch.object(
                 controller,
                 "_catalog_position",
@@ -441,7 +469,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
             ),
             patch.object(
                 controller,
-                "_ocr_current_canvas",
+                "_read_current_page_visual_rows",
                 return_value=["页面第一行。", "页面第二行。"],
             ) as visual_rows,
         ):
@@ -449,6 +477,95 @@ class WeReadControllerChapterTests(unittest.TestCase):
 
         visual_rows.assert_called_once_with()
         self.assertEqual(payload["paragraphs"], ["页面第一行。", "页面第二行。"])
+
+    def test_current_page_canvas_capture_never_scrolls_the_chapter(self):
+        controller, page = self.make_connected_controller()
+        first_canvas = Mock()
+        first_canvas.evaluate.return_value = png_data_url(height=420)
+        second_canvas = Mock()
+        second_canvas.evaluate.return_value = png_data_url(height=421)
+        canvases = Mock()
+        canvases.count.return_value = 2
+        canvases.first = first_canvas
+        canvases.nth.return_value = second_canvas
+        page.locator.return_value = canvases
+        controller._ocr_engine = Mock(
+            side_effect=[
+                (
+                    [([[10, 90], [500, 90], [500, 130], [10, 130]], "左页。", 0.98)],
+                    None,
+                ),
+                (
+                    [([[10, 90], [500, 90], [500, 130], [10, 130]], "右页。", 0.98)],
+                    None,
+                ),
+            ]
+        )
+
+        rows = controller._ocr_current_page_canvases()
+
+        self.assertEqual(rows, ["左页。", "右页。"])
+        page.locator.assert_called_once_with(".renderTargetContainer canvas")
+        page.evaluate.assert_not_called()
+
+    def test_ensure_horizontal_layout_uses_the_layout_control(self):
+        controller, page = self.make_connected_controller()
+        horizontal = Mock()
+        horizontal.count.return_value = 0
+        toggle = Mock()
+        toggle.count.return_value = 1
+        toggle.first = toggle
+
+        def locator(selector):
+            if selector == ".wr_horizontalReader":
+                return horizontal
+            if selector == ".readerControls_item.showBookReviews + .readerControls_item":
+                return toggle
+            return Mock()
+
+        page.locator.side_effect = locator
+
+        controller._ensure_horizontal_layout()
+
+        toggle.click.assert_called_once_with()
+        page.wait_for_function.assert_called_once()
+        self.assertEqual(page.wait_for_function.call_args.kwargs["timeout"], 10_000)
+
+    def test_page_turn_clicks_public_control_and_waits_for_new_render(self):
+        controller, page = self.make_connected_controller()
+        button = Mock()
+        button.count.return_value = 1
+        button.first = button
+        button.is_visible.return_value = True
+        button.is_enabled.return_value = True
+        page.locator.return_value = button
+
+        with (
+            patch.object(controller, "_ensure_horizontal_layout"),
+            patch.object(controller, "_page_signature", return_value="page-before"),
+        ):
+            controller.next_page()
+
+        page.locator.assert_called_with(
+            ".renderTarget_pager_button.renderTarget_pager_button_right"
+        )
+        button.click.assert_called_once_with()
+        page_change_wait = page.wait_for_function.call_args_list[0]
+        self.assertEqual(page_change_wait.args[1], "page-before")
+        self.assertEqual(page_change_wait.kwargs["timeout"], 20_000)
+
+    def test_page_turn_reports_unavailable_boundary(self):
+        controller, page = self.make_connected_controller()
+        button = Mock()
+        button.count.return_value = 1
+        button.first = button
+        button.is_visible.return_value = True
+        button.is_enabled.return_value = False
+        page.locator.return_value = button
+
+        with patch.object(controller, "_ensure_horizontal_layout"):
+            with self.assertRaisesRegex(WeReadError, "最后一页"):
+                controller.next_page()
 
     def test_positioned_only_chapter_does_not_require_ocr_engine(self):
         controller, page = self.make_connected_controller()
@@ -487,6 +604,52 @@ class WeReadControllerChapterTests(unittest.TestCase):
         get_ocr_engine.assert_not_called()
         self.assertEqual(lines, ["第一行。", "第二行。", "最后一行。"])
 
+    def test_ocr_restores_the_browser_scroll_position_after_scanning(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.screenshot.return_value = png_bytes()
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = canvas
+        page.locator.return_value = locator
+        actions = []
+
+        def evaluate(_script, action):
+            actions.append(action)
+            if action == "current":
+                return {
+                    "at_bottom": False,
+                    "position": 320,
+                    "maximum": 1000,
+                    "chapter_height": 1800,
+                }
+            return {
+                "at_bottom": True,
+                "position": 1000,
+                "maximum": 1000,
+                "chapter_height": 1800,
+            }
+
+        page.evaluate.side_effect = evaluate
+        controller._ocr_engine = Mock(
+            return_value=(
+                [
+                    (
+                        [[16, 170], [700, 170], [700, 216], [16, 216]],
+                        "正文。",
+                        0.98,
+                    )
+                ],
+                None,
+            )
+        )
+
+        with patch.object(controller, "_positioned_text_rows", return_value=[]):
+            controller._ocr_current_canvas()
+
+        self.assertEqual(actions[0], "current")
+        self.assertEqual(actions[-1], {"position": 320})
+
     def test_ocr_ignores_canvas_header_navigation(self):
         controller, page = self.make_connected_controller()
         canvas = Mock()
@@ -513,8 +676,8 @@ class WeReadControllerChapterTests(unittest.TestCase):
         canvas.screenshot.assert_any_call(type="png", scale="device")
         self.assertEqual(controller._ocr_engine.call_args.kwargs["unclip_ratio"], 1.8)
         self.assertEqual(
-            [call.args[1] for call in page.evaluate.call_args_list[:2]],
-            ["top", "top"],
+            [call.args[1] for call in page.evaluate.call_args_list[:3]],
+            ["current", "top", "top"],
         )
 
     def test_ocr_merges_horizontal_fragments_into_one_visual_row(self):
@@ -762,7 +925,7 @@ class WeReadControllerChapterTests(unittest.TestCase):
             {},
             {"at_bottom": False},
             {"at_bottom": False},
-        ] + [{"at_bottom": True}] * 10
+        ] + [{"at_bottom": True}] * 12
         controller._ocr_engine = Mock(
             side_effect=[
                 (
@@ -957,15 +1120,6 @@ class WeReadControllerChapterTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(WeReadError, "最后一章"):
                 controller.next_chapter()
-
-    def test_restore_catalog_chapter_clicks_saved_stable_id(self):
-        controller, page = self.make_connected_controller()
-
-        with patch.object(controller, "_select_catalog_chapter") as select:
-            controller.open_chapter_url(page.url, "catalog:stable-twelve")
-
-        page.goto.assert_called_once_with(page.url, wait_until="domcontentloaded")
-        select.assert_called_once_with("catalog:stable-twelve")
 
     def test_catalog_id_is_stable_when_front_matter_list_changes(self):
         controller, page = self.make_connected_controller()
