@@ -135,6 +135,43 @@ class FakeWeReadController:
         self._record("close")
 
 
+class PagingFakeWeReadController(FakeWeReadController):
+    """A small linear book used to exercise speculative page movement."""
+
+    def __init__(self):
+        super().__init__()
+        self.position = 0
+        self.pages = {
+            -1: "上一页。",
+            0: "当前页。",
+            1: "下一页。",
+            2: "下下页。",
+        }
+
+    def get_current_chapter(self):
+        self._record("current")
+        return {
+            "book_id": "book-1",
+            "book_title": "测试书",
+            "chapter_id": "chapter-1",
+            "chapter_title": "第一章",
+            "chapter_url": "https://weread.qq.com/web/reader/book-1-chapter-1",
+            "paragraphs": [self.pages[self.position]],
+        }
+
+    def next_page(self):
+        self._record("next_page")
+        if self.position >= max(self.pages):
+            raise WeReadError("当前已经是最后一页。")
+        self.position += 1
+
+    def previous_page(self):
+        self._record("previous_page")
+        if self.position <= min(self.pages):
+            raise WeReadError("当前已经是第一页。")
+        self.position -= 1
+
+
 class WeReadIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -143,6 +180,7 @@ class WeReadIntegrationTests(unittest.TestCase):
     def test_open_waits_without_showing_a_login_confirmation_dialog(self):
         controller = FakeWeReadController(reader_page=False)
         integration = WeReadIntegration(controller)
+        self.addCleanup(integration.close)
 
         with patch("main.QMessageBox.information") as information:
             chapter = integration.open(None)
@@ -244,6 +282,49 @@ class WeReadIntegrationTests(unittest.TestCase):
         self.assertIsInstance(ready_spy.at(0)[0], WeReadChapter)
         self.assertEqual(ready_spy.at(0)[1], -1)
 
+    def test_prefetch_restores_browser_and_serves_both_directions_from_cache(self):
+        controller = PagingFakeWeReadController()
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        self.assertIsNotNone(integration.open(None))
+        ready_spy = QSignalSpy(integration.page_ready)
+
+        integration._prefetch_future.result(timeout=1)
+
+        self.assertEqual(controller.position, 0)
+        self.assertEqual(controller.calls[-3:], ["next_page", "current", "previous_page"])
+
+        self.assertTrue(integration.change_page(None, 1))
+        self.assertEqual(ready_spy.count(), 1)
+        self.assertEqual(ready_spy.at(0)[0].units, ("下一页。",))
+        integration._page_future.result(timeout=1)
+        self.assertEqual(controller.position, 1)
+
+        self.assertTrue(integration.change_page(None, -1))
+        self.assertEqual(ready_spy.count(), 2)
+        self.assertEqual(ready_spy.at(1)[0].units, ("当前页。",))
+        integration._page_future.result(timeout=1)
+        self.assertEqual(controller.position, 0)
+
+    def test_page_cache_keeps_only_five_nearest_snapshots(self):
+        integration = WeReadIntegration(FakeWeReadController())
+        self.addCleanup(integration.close)
+        chapter = WeReadChapter(
+            book_id="book-1",
+            book_title="测试书",
+            chapter_id="chapter-1",
+            chapter_title="第一章",
+            chapter_url="https://weread.qq.com/web/reader/book-1",
+            units=("正文。",),
+        )
+        with integration._page_state_lock:
+            integration._current_page_index = 4
+            integration._page_cache = {index: chapter for index in range(9)}
+            integration._prune_page_cache_locked()
+
+        self.assertEqual(len(integration._page_cache), 5)
+        self.assertIn(4, integration._page_cache)
+
     def test_page_turn_error_is_emitted_without_worker_message_box(self):
         controller = FakeWeReadController(error=WeReadError("页面读取失败"))
         integration = WeReadIntegration(controller, poll_interval_seconds=0)
@@ -275,6 +356,7 @@ class WeReadIntegrationTests(unittest.TestCase):
     def test_open_uses_the_current_browser_chapter_without_saved_state(self):
         controller = FakeWeReadController()
         integration = WeReadIntegration(controller)
+        self.addCleanup(integration.close)
 
         chapter = integration.open(None)
 

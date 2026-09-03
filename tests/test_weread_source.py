@@ -508,6 +508,28 @@ class WeReadControllerChapterTests(unittest.TestCase):
         page.locator.assert_called_once_with(".renderTargetContainer canvas")
         page.evaluate.assert_not_called()
 
+    def test_current_page_canvas_ocr_is_reused_by_pixel_hash(self):
+        controller, page = self.make_connected_controller()
+        canvas = Mock()
+        canvas.evaluate.return_value = png_data_url(height=420)
+        canvases = Mock()
+        canvases.count.return_value = 1
+        canvases.first = canvas
+        page.locator.return_value = canvases
+        controller._ocr_engine = Mock(
+            return_value=(
+                [([[10, 90], [500, 90], [500, 130], [10, 130]], "缓存正文。", 0.98)],
+                None,
+            )
+        )
+
+        first = controller._ocr_current_page_canvases()
+        second = controller._ocr_current_page_canvases()
+
+        self.assertEqual(first, ["缓存正文。"])
+        self.assertEqual(second, first)
+        self.assertEqual(controller._ocr_engine.call_count, 1)
+
     def test_ensure_horizontal_layout_uses_the_layout_control(self):
         controller, page = self.make_connected_controller()
         horizontal = Mock()
@@ -583,6 +605,31 @@ class WeReadControllerChapterTests(unittest.TestCase):
         with patch.object(controller, "_ensure_horizontal_layout"):
             with self.assertRaisesRegex(WeReadError, "最后一页"):
                 controller.next_page()
+
+    def test_catalog_switch_waits_for_content_change_without_fixed_pause(self):
+        controller, page = self.make_connected_controller()
+        items = Mock()
+        items.count.return_value = 2
+        target = Mock()
+        target.evaluate.return_value = False
+        target.is_visible.return_value = True
+        items.nth.return_value = target
+        page.locator.return_value = items
+
+        with (
+            patch.object(controller, "_page_signature", return_value="old-page"),
+            patch.object(controller, "_wait_for_page_change") as wait_for_change,
+            patch.object(controller, "_wait_for_chapter_render") as wait_for_render,
+        ):
+            controller._select_catalog_index(1)
+
+        target.click.assert_called_once_with()
+        wait_for_change.assert_called_once_with("old-page")
+        wait_for_render.assert_called_once_with()
+        self.assertNotIn(
+            500,
+            [call.args[0] for call in page.wait_for_timeout.call_args_list],
+        )
 
     def test_positioned_only_chapter_does_not_require_ocr_engine(self):
         controller, page = self.make_connected_controller()

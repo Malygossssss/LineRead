@@ -7,7 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock
 from time import monotonic
 from typing import Any
 
@@ -24,6 +24,7 @@ STARTUP_CONNECTING_TEXT = "正在连接微信读书…"
 STARTUP_LOGIN_TEXT = "等待登录…"
 STARTUP_BOOK_TEXT = "等待选书…"
 STARTUP_RENDERING_TEXT = "文本渲染中…"
+PAGE_CACHE_LIMIT = 5
 INSTANCE_KEY = "LineRead-" + sha256(
     str(Path(__file__).resolve()).casefold().encode("utf-8")
 ).hexdigest()[:16]
@@ -60,7 +61,14 @@ class WeReadIntegration(QObject):
         self._startup_future: Future[Any] | None = None
         self._chapter_future: Future[Any] | None = None
         self._page_future: Future[Any] | None = None
+        self._prefetch_future: Future[Any] | None = None
         self._stop_event = Event()
+        self._page_state_lock = RLock()
+        self._page_cache: dict[int, WeReadChapter] = {}
+        self._page_cache_generation = 0
+        self._current_page_index: int | None = None
+        self._browser_page_index: int | None = None
+        self._prefetch_attempted: set[tuple[int, int]] = set()
 
     @property
     def controller(self) -> WeReadController:
@@ -81,7 +89,9 @@ class WeReadIntegration(QObject):
         """Recapture the chapter currently open in the WeRead browser."""
 
         try:
-            return self._run_sync(self._open_worker)
+            chapter = self._run_sync(self._open_worker)
+            self.prime_page_cache(chapter)
+            return chapter
         except WeReadError as exc:
             QMessageBox.warning(parent, "微信读书连接失败", str(exc))
             return None
@@ -108,7 +118,9 @@ class WeReadIntegration(QObject):
                 "请在微信读书浏览器中手动选择并进入新书。\n\n"
                 "完成后回到此提示并点击“确定”，LineRead 将从当前页面第一行开始。",
             )
-            return self._run_sync(self._wait_and_load_worker)
+            chapter = self._run_sync(self._wait_and_load_worker)
+            self.prime_page_cache(chapter)
+            return chapter
         except WeReadError as exc:
             QMessageBox.warning(parent, "切换书籍失败", str(exc))
             return None
@@ -152,6 +164,19 @@ class WeReadIntegration(QObject):
             return self._submit_page_change(self.source.previous_page, direction)
         return False
 
+    def prime_page_cache(self, chapter: WeReadChapter) -> None:
+        """Start a fresh in-memory page window from one displayed snapshot."""
+
+        if not isinstance(chapter, WeReadChapter) or self._stop_event.is_set():
+            return
+        with self._page_state_lock:
+            self._page_cache_generation += 1
+            self._page_cache = {0: chapter}
+            self._current_page_index = 0
+            self._browser_page_index = 0
+            self._prefetch_attempted.clear()
+        self._schedule_page_prefetch()
+
     def close(self) -> None:
         self._stop_event.set()
         executor = self._executor
@@ -163,7 +188,12 @@ class WeReadIntegration(QObject):
             self._startup_future is not None and not self._startup_future.done()
         ) or (
             self._chapter_future is not None and not self._chapter_future.done()
-        ) or (self._page_future is not None and not self._page_future.done())
+        ) or (
+            self._page_future is not None and not self._page_future.done()
+        ) or (
+            self._prefetch_future is not None
+            and not self._prefetch_future.done()
+        )
         try:
             close_future = executor.submit(self._close_worker)
             if not worker_running:
@@ -272,6 +302,28 @@ class WeReadIntegration(QObject):
             return False
         if self._page_future is not None and not self._page_future.done():
             return False
+
+        cached: WeReadChapter | None = None
+        target_index: int | None = None
+        generation = 0
+        with self._page_state_lock:
+            if self._current_page_index is not None:
+                target_index = self._current_page_index + direction
+                cached = self._page_cache.get(target_index)
+                generation = self._page_cache_generation
+                if cached is not None:
+                    self._current_page_index = target_index
+                    self._prune_page_cache_locked()
+
+        if cached is not None and target_index is not None:
+            self.page_ready.emit(cached, direction)
+            self._page_future = self._ensure_executor().submit(
+                self._cached_page_worker,
+                target_index,
+                generation,
+            )
+            return True
+
         self._page_future = self._ensure_executor().submit(
             self._page_worker,
             callback,
@@ -285,12 +337,181 @@ class WeReadIntegration(QObject):
         direction: int,
     ) -> None:
         try:
+            with self._page_state_lock:
+                base_index = self._current_page_index
+                generation = self._page_cache_generation
+                target_index = (
+                    base_index + direction if base_index is not None else None
+                )
+                chapter = (
+                    self._page_cache.get(target_index)
+                    if target_index is not None
+                    else None
+                )
+
+            if chapter is not None and target_index is not None:
+                with self._page_state_lock:
+                    if generation != self._page_cache_generation:
+                        return
+                    self._current_page_index = target_index
+                    self._prune_page_cache_locked()
+                if not self._stop_event.is_set():
+                    self.page_ready.emit(chapter, direction)
+                self._sync_browser_to_index(target_index, generation)
+                self._schedule_page_prefetch()
+                return
+
+            if base_index is not None:
+                self._sync_browser_to_index(base_index, generation)
             chapter = callback()
+
+            if target_index is not None:
+                with self._page_state_lock:
+                    if generation != self._page_cache_generation:
+                        return
+                    self._browser_page_index = target_index
+                    self._current_page_index = target_index
+                    self._page_cache[target_index] = chapter
+                    self._prune_page_cache_locked()
             if not self._stop_event.is_set():
                 self.page_ready.emit(chapter, direction)
+            if target_index is not None:
+                self._schedule_page_prefetch()
         except Exception as exc:
             if not self._stop_event.is_set():
                 self.page_failed.emit(_error_message(exc))
+
+    def _cached_page_worker(self, target_index: int, generation: int) -> None:
+        """Move the browser after the UI has consumed an in-memory page."""
+
+        try:
+            self._sync_browser_to_index(target_index, generation)
+            with self._page_state_lock:
+                chapter = self._page_cache.get(target_index)
+            if chapter is not None:
+                self.source.cached_chapter = chapter
+            self._schedule_page_prefetch()
+        except Exception:
+            # The cached snapshot remains readable. A later demand operation will
+            # retry synchronization from the last confirmed browser index.
+            return
+
+    def _schedule_page_prefetch(self) -> None:
+        """Queue one forward capture when the current cache window needs it."""
+
+        if self._stop_event.is_set():
+            return
+        with self._page_state_lock:
+            if self._current_page_index is None:
+                return
+            generation = self._page_cache_generation
+            base_index = self._current_page_index
+            key = (generation, base_index)
+            if base_index + 1 in self._page_cache or key in self._prefetch_attempted:
+                return
+            if self._prefetch_future is not None and not self._prefetch_future.done():
+                return
+            self._prefetch_attempted.add(key)
+            future = self._ensure_executor().submit(
+                self._prefetch_page_worker,
+                generation,
+                base_index,
+            )
+            self._prefetch_future = future
+            future.add_done_callback(self._page_prefetch_finished)
+
+    def _page_prefetch_finished(self, _future: Future[Any]) -> None:
+        # A new chapter can be primed while an older speculative task is winding
+        # down. Once the executor is free, give the new generation its turn.
+        self._schedule_page_prefetch()
+
+    def _prefetch_page_worker(self, generation: int, base_index: int) -> None:
+        """Capture the next page and restore the browser before publishing it."""
+
+        moved_forward = False
+        restored = False
+        chapter: WeReadChapter | None = None
+        try:
+            with self._page_state_lock:
+                if (
+                    generation != self._page_cache_generation
+                    or base_index != self._current_page_index
+                ):
+                    return
+            self._sync_browser_to_index(base_index, generation)
+            self.controller.next_page()
+            moved_forward = True
+            with self._page_state_lock:
+                if generation == self._page_cache_generation:
+                    self._browser_page_index = base_index + 1
+            chapter = self.source.load_current_chapter()
+        except Exception:
+            chapter = None
+        finally:
+            if moved_forward:
+                try:
+                    self.controller.previous_page()
+                    restored = True
+                    with self._page_state_lock:
+                        if generation == self._page_cache_generation:
+                            self._browser_page_index = base_index
+                except Exception:
+                    restored = False
+
+        if chapter is None or not restored or self._stop_event.is_set():
+            return
+        with self._page_state_lock:
+            if (
+                generation != self._page_cache_generation
+                or base_index != self._current_page_index
+            ):
+                return
+            self._page_cache[base_index + 1] = chapter
+            current = self._page_cache.get(base_index)
+            self._prune_page_cache_locked()
+        if current is not None:
+            self.source.cached_chapter = current
+
+    def _sync_browser_to_index(self, target_index: int, generation: int) -> None:
+        """Move the single browser page to a known logical cache position."""
+
+        while not self._stop_event.is_set():
+            with self._page_state_lock:
+                if generation != self._page_cache_generation:
+                    return
+                current = self._browser_page_index
+            if current is None or current == target_index:
+                return
+            direction = 1 if target_index > current else -1
+            if direction > 0:
+                self.controller.next_page()
+            else:
+                self.controller.previous_page()
+            with self._page_state_lock:
+                if generation != self._page_cache_generation:
+                    return
+                self._browser_page_index = current + direction
+
+    def _prune_page_cache_locked(self) -> None:
+        if (
+            self._current_page_index is None
+            or len(self._page_cache) <= PAGE_CACHE_LIMIT
+        ):
+            return
+        keep = set(
+            sorted(
+                self._page_cache,
+                key=lambda index: (
+                    abs(index - self._current_page_index),
+                    -index,
+                ),
+            )[:PAGE_CACHE_LIMIT]
+        )
+        self._page_cache = {
+            index: chapter
+            for index, chapter in self._page_cache.items()
+            if index in keep
+        }
 
     def _run_sync(self, callback: Callable[[], Any]) -> Any:
         if self._executor is None:
@@ -336,8 +557,10 @@ def main() -> int:
         reader.set_loading_status(STARTUP_CONNECTING_TEXT)
         integration.startup_status.connect(reader.set_loading_status)
         integration.startup_ready.connect(reader.load_weread_chapter)
+        integration.startup_ready.connect(integration.prime_page_cache)
         integration.startup_failed.connect(reader.show_loading_error)
         integration.chapter_ready.connect(reader.finish_chapter_change)
+        integration.chapter_ready.connect(integration.prime_page_cache)
         integration.chapter_failed.connect(reader.fail_chapter_change)
         integration.page_ready.connect(reader.finish_page_change)
         integration.page_failed.connect(reader.fail_page_change)

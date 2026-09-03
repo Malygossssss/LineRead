@@ -7,6 +7,7 @@ import os
 import re
 from base64 import b64decode
 from binascii import Error as BinasciiError
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -33,6 +34,7 @@ OCR_RETRY_PADDING_PX = 12
 OCR_CANVAS_DISCOVERY_WAIT_MS = 500
 OCR_CANVAS_STABLE_PASSES = 8
 OCR_CANVAS_MAX_DISCOVERY_PASSES = 200
+OCR_PAGE_CACHE_SIZE = 16
 
 
 class WeReadError(RuntimeError):
@@ -97,6 +99,7 @@ class WeReadController:
         self.browser_channel = ""
         self._ocr_engine_factory = ocr_engine_factory
         self._ocr_engine: Any = None
+        self._ocr_page_cache: OrderedDict[bytes, tuple[_OcrLine, ...]] = OrderedDict()
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
@@ -392,13 +395,7 @@ class WeReadController:
         before = self._page_signature()
         try:
             button.first.click()
-            self.page.wait_for_function(
-                _CURRENT_PAGE_CHANGED,
-                arg=before,
-                polling=100,
-                timeout=20_000,
-            )
-            self.page.wait_for_timeout(250)
+            self._wait_for_page_change(before)
             self._wait_for_chapter_render()
         except Exception as exc:
             raise WeReadError(
@@ -409,6 +406,28 @@ class WeReadController:
     def _page_signature(self) -> str:
         value = self.page.evaluate(_EXTRACT_CURRENT_PAGE_SIGNATURE)
         return value if isinstance(value, str) else ""
+
+    def _wait_for_page_change(self, previous: str) -> None:
+        """Wait for new content and only as long as its render keeps changing."""
+
+        self.page.wait_for_function(
+            _CURRENT_PAGE_CHANGED,
+            arg=previous,
+            polling=100,
+            timeout=20_000,
+        )
+        last = self._page_signature()
+        stable_passes = 0
+        for _ in range(10):
+            self.page.wait_for_timeout(50)
+            current = self._page_signature()
+            if current and current != previous and current == last:
+                stable_passes += 1
+                if stable_passes >= 2:
+                    return
+            else:
+                stable_passes = 0
+                last = current
 
     def _wait_for_chapter_render(self) -> None:
         """Wait past WeRead's small asynchronous loading shell."""
@@ -473,6 +492,7 @@ class WeReadController:
             "node => node.classList.contains('readerCatalog_list_item_selected')"
         ):
             return
+        before = self._page_signature()
         if not target.is_visible():
             catalog_button = self.page.locator(".readerControls_item.catalog")
             if catalog_button.count() == 0 or not catalog_button.first.is_visible():
@@ -488,7 +508,8 @@ class WeReadController:
             arg=index,
             timeout=20_000,
         )
-        self.page.wait_for_timeout(500)
+        self._wait_for_page_change(before)
+        self._wait_for_chapter_render()
 
     def _read_current_page_visual_rows(self) -> list[str]:
         """Read visible Canvas and positioned text without turning or scrolling."""
@@ -523,7 +544,14 @@ class WeReadController:
             if screenshot_hash in seen_canvas_hashes:
                 continue
             seen_canvas_hashes.add(screenshot_hash)
-            lines = _ocr_canvas_lines(engine, screenshot, ignore_header=False)
+            lines = self._ocr_page_cache.pop(screenshot_hash, None)
+            if lines is None:
+                lines = tuple(
+                    _ocr_canvas_lines(engine, screenshot, ignore_header=False)
+                )
+            self._ocr_page_cache[screenshot_hash] = lines
+            while len(self._ocr_page_cache) > OCR_PAGE_CACHE_SIZE:
+                self._ocr_page_cache.popitem(last=False)
             _extend_with_boundary_overlap(
                 texts,
                 tuple(line.text for line in lines),
@@ -1396,9 +1424,6 @@ _EXTRACT_CURRENT_PAGE_SIGNATURE = r"""
     }
     return (result >>> 0).toString(16);
   };
-  const selected = Array.from(
-    document.querySelectorAll('.readerCatalog_list_item')
-  ).findIndex(node => node.classList.contains('readerCatalog_list_item_selected'));
   const text = Array.from(root.querySelectorAll(
     'p, h1, h2, h3, [data-wr-role="text"]'
   )).filter(visible).map(node => {
@@ -1416,7 +1441,7 @@ _EXTRACT_CURRENT_PAGE_SIGNATURE = r"""
       }
     }
   ).join('|');
-  return `${selected}:${hash(text)}:${canvases}`;
+  return `${hash(text)}:${canvases}`;
 }
 """
 
@@ -1442,9 +1467,6 @@ _CURRENT_PAGE_CHANGED = r"""
     }
     return (result >>> 0).toString(16);
   };
-  const selected = Array.from(
-    document.querySelectorAll('.readerCatalog_list_item')
-  ).findIndex(node => node.classList.contains('readerCatalog_list_item_selected'));
   const text = Array.from(root.querySelectorAll(
     'p, h1, h2, h3, [data-wr-role="text"]'
   )).filter(visible).map(node => {
@@ -1462,7 +1484,7 @@ _CURRENT_PAGE_CHANGED = r"""
       }
     }
   ).join('|');
-  const current = `${selected}:${hash(text)}:${canvases}`;
+  const current = `${hash(text)}:${canvases}`;
   return !!current && current !== previous;
 }
 """
