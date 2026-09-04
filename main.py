@@ -300,8 +300,6 @@ class WeReadIntegration(QObject):
             return False
         if self._chapter_future is not None and not self._chapter_future.done():
             return False
-        if self._page_future is not None and not self._page_future.done():
-            return False
 
         cached: WeReadChapter | None = None
         target_index: int | None = None
@@ -317,12 +315,18 @@ class WeReadIntegration(QObject):
 
         if cached is not None and target_index is not None:
             self.page_ready.emit(cached, direction)
+            # Cached pages remain navigable while an older browser-alignment
+            # task is running; the single-worker executor keeps those moves
+            # ordered behind the already-visible UI changes.
             self._page_future = self._ensure_executor().submit(
                 self._cached_page_worker,
                 target_index,
                 generation,
             )
             return True
+
+        if self._page_future is not None and not self._page_future.done():
+            return False
 
         self._page_future = self._ensure_executor().submit(
             self._page_worker,

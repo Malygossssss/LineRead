@@ -1,7 +1,7 @@
 import os
 import sys
 import unittest
-from threading import get_ident
+from threading import Event, get_ident
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -305,6 +305,41 @@ class WeReadIntegrationTests(unittest.TestCase):
         self.assertEqual(ready_spy.at(1)[0].units, ("当前页。",))
         integration._page_future.result(timeout=1)
         self.assertEqual(controller.position, 0)
+
+    def test_cached_page_turn_accepts_immediate_reverse_while_browser_syncs(self):
+        controller = PagingFakeWeReadController()
+        integration = WeReadIntegration(controller, poll_interval_seconds=0)
+        self.addCleanup(integration.close)
+        self.assertIsNotNone(integration.open(None))
+        integration._prefetch_future.result(timeout=1)
+
+        self.assertTrue(integration.change_page(None, 1))
+        integration._page_future.result(timeout=1)
+        integration._prefetch_future.result(timeout=1)
+
+        ready_spy = QSignalSpy(integration.page_ready)
+        sync_started = Event()
+        release_sync = Event()
+        original_worker = integration._cached_page_worker
+
+        def blocked_worker(target_index, generation):
+            sync_started.set()
+            release_sync.wait(timeout=1)
+            original_worker(target_index, generation)
+
+        integration._cached_page_worker = blocked_worker
+        try:
+            self.assertTrue(integration.change_page(None, -1))
+            self.assertTrue(sync_started.wait(timeout=1))
+
+            self.assertTrue(integration.change_page(None, 1))
+            self.assertEqual(ready_spy.count(), 2)
+            self.assertEqual(ready_spy.at(1)[0].units, ("下一页。",))
+        finally:
+            release_sync.set()
+
+        integration._page_future.result(timeout=1)
+        self.assertEqual(controller.position, 1)
 
     def test_page_cache_keeps_only_five_nearest_snapshots(self):
         integration = WeReadIntegration(FakeWeReadController())
